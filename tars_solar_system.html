@@ -51,13 +51,21 @@
     const SCALE = 149597870.7;     // Render units per AU (1 unit = 1 km)
     const YEAR_SECONDS = 365.25 * 24 * 3600; // seconds per Earth year
     const REALTIME_YEARS_PER_SEC = 1 / YEAR_SECONDS; // 1x realtime = this many sim years per real second
+    const AU_METERS = 149597870700; // meters per AU
+    const C_LIGHT = 299792458; // m/s
+    const L_SUN = 3.828e26; // Watts (luminosity of the sun)
     const physics = {
       muSun: 1.0,                  // AU^3 / year^2
       maxDt: 1/3600,               // years
-      spinGainK: 0.8,              // spin-up gain scaling (higher near Sun)
-      spinDecay: 0.02,             // small natural decay
+      spinDecay: 0.00,             // small natural decay
       nBodyAttractors: true,       // include planetary gravity on craft/payloads
-      // Note: Only one Δv quantity conceptually exists now: payload exit velocity at release
+      
+      // New TARS physics
+      sailArea: 5000, // m^2 (of one sail, so 2*sailArea total)
+      sailLeverArm: 50, // meters (distance from center of mass to center of pressure of one sail)
+      momentOfInertia: 1e8, // kg*m^2
+      sailReflectivityWhite: 0.9,
+      sailReflectivityBlack: 0.1,
     };
     // Trail sampling (to reduce jitter at low time scales)
     const trailSampling = {
@@ -653,17 +661,23 @@
       const a1 = nBodyAccelAUPerYr2(tars.position.clone());
       tars.velocity.addScaledVector(a1, dtYears * 0.5);
 
-      // Spin gain from solar irradiance ~ 1 / r^2
-      const rLen = Math.max(1e-12, tars.position.length());
-      const spinGain = physics.spinGainK * dtYears / (rLen * rLen);
-      if (spinGain > 0) tars.spin += spinGain;
+      // Spin gain from solar radiation pressure
+      const r_AU = tars.position.length();
+      const r_m = r_AU * AU_METERS;
+      const solarIrradiance = L_SUN / (4 * Math.PI * r_m * r_m); // W/m^2
+
+      const force_white = (solarIrradiance / C_LIGHT) * physics.sailArea * (1 + physics.sailReflectivityWhite);
+      const force_black = (solarIrradiance / C_LIGHT) * physics.sailArea * (1 + physics.sailReflectivityBlack);
+      
+      const torque = (force_white - force_black) * physics.sailLeverArm; // N*m
+      
+      const angular_acceleration = torque / physics.momentOfInertia; // rad/s^2
+      
+      const dtSeconds = dtYears * YEAR_SECONDS;
+      tars.spin += angular_acceleration * dtSeconds;
+
       // Natural spin decay
       tars.spin = Math.max(0, tars.spin - physics.spinDecay * dtYears);
-
-      // No Δv reserve in this model; payload exit velocity at release is the single Δv quantity tracked
-
-      // Visual placement handled per-frame in animate() with smoothing
-      // Orientation and visual spin are applied once per frame in the main loop
     }
 
     // Initialize TARS orbital velocity for near-circular orbit at its radius
@@ -815,8 +829,12 @@
     }
     physForm.appendChild(makeField('muSun (AU^3/yr^2)', 'muSun', 0.001, 0.0001));
     physForm.appendChild(makeField('maxDt (yr)', 'maxDt', 0.0001, 0.00001));
-    physForm.appendChild(makeField('spinGainK', 'spinGainK', 0.01, 0));
     physForm.appendChild(makeField('spinDecay', 'spinDecay', 0.001, 0));
+    physForm.appendChild(makeField('Sail Area (m^2)', 'sailArea', 100, 0));
+    physForm.appendChild(makeField('Sail Lever Arm (m)', 'sailLeverArm', 1, 0));
+    physForm.appendChild(makeField('Moment of Inertia (kg*m^2)', 'momentOfInertia', 1e7, 0));
+    physForm.appendChild(makeField('Reflectivity (White Sail)', 'sailReflectivityWhite', 0.01, 0, 1));
+    physForm.appendChild(makeField('Reflectivity (Black Sail)', 'sailReflectivityBlack', 0.01, 0, 1));
     // N-body toggle
     const nBodyRow = document.createElement('div'); nBodyRow.className = 'row';
     const nBodyLbl = document.createElement('label'); nBodyLbl.textContent = 'N-body (planets attract craft/payloads)';
@@ -921,7 +939,7 @@
       vecX: 1, vecY: 0, vecZ: 0 // vector components in world frame (normalized when used)
     };
     function rowWrap(...nodes) { const r = document.createElement('div'); r.className = 'row'; nodes.forEach(n => r.appendChild(n)); return r; }
-    const modeSel = document.createElement('span'); modeSel.textContent = 'Mode: vector';
+    const modeSel = document.createElement('span'); modeSel.textContent = 'Vector';
     const dvLbl = document.createElement('label'); dvLbl.textContent = 'Δv (m/s)';
     const dvInput = document.createElement('input'); dvInput.type='number'; dvInput.step='1'; dvInput.value=String(payloadState.dvMag);
     dvInput.onchange = ()=> { const v = parseFloat(dvInput.value)||0; payloadState.dvMag = v; preview.dirty = true; };
@@ -944,8 +962,7 @@
     const targetSel = document.createElement('select');
     ['None','Sun','Mercury','Venus','Earth','Mars','Jupiter','Saturn','Uranus','Neptune','Point'].forEach(n=>{ const o=document.createElement('option'); o.value=n; o.textContent=n; targetSel.appendChild(o); });
     targetSel.onchange = ()=>{ targetState.body = targetSel.value; if (targetSel.value !== 'Point') targetState.point = null; };
-    const btnSetPoint = document.createElement('button'); btnSetPoint.textContent = 'Pick point (click scene)';
-    let pickPointActive = false; btnSetPoint.onclick = ()=>{ pickPointActive = !pickPointActive; btnSetPoint.textContent = pickPointActive ? 'Picking… click scene' : 'Pick point (click scene)'; };
+    
     const previewToggle = document.createElement('button'); previewToggle.textContent = 'Preview: Off';
     previewToggle.onclick = ()=>{ preview.enabled = !preview.enabled; preview.payload.line.visible = preview.enabled; preview.dirty = true; previewToggle.textContent = `Preview: ${preview.enabled ? 'On' : 'Off'}`; };
     const horizonLabel = document.createElement('label'); horizonLabel.textContent = 'Horizon (days)';
@@ -954,19 +971,13 @@
     const stepsLabel = document.createElement('label'); stepsLabel.textContent = 'Steps';
     const stepsInput = document.createElement('input'); stepsInput.type='number'; stepsInput.step='10'; stepsInput.min='10'; stepsInput.max='2000'; stepsInput.value = String(preview.steps);
     stepsInput.onchange = ()=>{ const s = Math.min(2000, Math.max(10, parseInt(stepsInput.value)||300)); preview.steps = s; preview.dirty = true; };
-    targetForm.appendChild(rowWrap(targetSel, btnSetPoint));
+    targetForm.appendChild(rowWrap(targetSel));
     targetForm.appendChild(rowWrap(previewToggle, horizonLabel, horizonInput, stepsLabel, stepsInput));
     panelLaunch.appendChild(payloadForm);
     panelLaunch.appendChild(targetForm);
     // Aim helpers UI (for vector mode)
     const aimForm = document.createElement('div'); aimForm.className = 'btnbar';
-    const aimRow1 = document.createElement('div'); aimRow1.className = 'row';
-    const aimRow2 = document.createElement('div'); aimRow2.className = 'row';
-    const aimLbl = document.createElement('label'); aimLbl.textContent = 'Aim sensitivity';
-    const aimSensitivity = document.createElement('input'); aimSensitivity.type='range'; aimSensitivity.min='0.0002'; aimSensitivity.max='0.02'; aimSensitivity.step='0.0002'; aimSensitivity.value='0.002';
-    const aimSensVal = document.createElement('span'); aimSensVal.className='value muted'; aimSensVal.textContent = aimSensitivity.value;
-    aimRow1.appendChild(aimLbl); aimRow1.appendChild(aimSensitivity); aimRow1.appendChild(aimSensVal);
-    aimForm.appendChild(aimRow1);
+    
     const azLbl = document.createElement('label'); azLbl.textContent='Azimuth (°)';
     const elLbl = document.createElement('label'); elLbl.textContent='Elevation (°)';
     const azInput = document.createElement('input'); azInput.type='number'; azInput.step='0.1'; azInput.min='-180'; azInput.max='180'; azInput.style.width='80px';
@@ -1083,30 +1094,11 @@
       aimBallCanvas.addEventListener('pointerleave', ()=>{ dragging = false; });
     })();
 
-    // 3D vector sight for payload aiming (visible in 'vector' mode)
-    const sight = new THREE.Group();
-    const axisLen = 10_000; // km in render units
-    const coneGeom = new THREE.ConeGeometry(axisLen * 0.1, axisLen * 0.5, 24);
-    const coneMat = new THREE.MeshBasicMaterial({ color: 0x44ff77, transparent: true, opacity: 0.35, depthTest: false });
-    const cone = new THREE.Mesh(coneGeom, coneMat);
-    cone.position.z = -axisLen * 0.25; // so the tip is at sight origin
-    cone.rotation.x = Math.PI / 2;
-    const axis = new THREE.AxesHelper(axisLen * 0.2);
-    axis.renderOrder = 9999; cone.renderOrder = 9999;
-    sight.add(cone); sight.add(axis);
-    sight.visible = false;
-    scene.add(sight);
-
-    function updateSightVisibility() {
-      sight.visible = state.focus === 'TARS';
-    }
-    updateSightVisibility();
-    // vector-only mode; keep sight visibility updated by focus
+    
 
     // -------- Movable sight gizmo (Shift+Drag to aim) --------
     const sightDrag = { active: false, lastX: 0, lastY: 0 };
-    let aimSense = 0.005;
-    aimSensitivity.oninput = ()=>{ aimSense = parseFloat(aimSensitivity.value)||0.005; aimSensVal.textContent = aimSensitivity.value; };
+    const aimSense = 0.005;
     function setVectorFromDir(dir) {
       const d = dir.clone(); if (d.lengthSq() < 1e-12) d.set(1,0,0); d.normalize();
       payloadState.vecX = d.x; payloadState.vecY = d.y; payloadState.vecZ = d.z; preview.dirty = true;
@@ -1133,7 +1125,7 @@
       const camForward = new THREE.Vector3(); camera.getWorldDirection(camForward);
       const camUp = new THREE.Vector3(0,1,0).applyQuaternion(camera.quaternion).normalize();
       const camRight = new THREE.Vector3().crossVectors(camUp, camForward).normalize();
-      curr.applyAxisAngle(camUp, -dx * aimSense);
+      curr.applyAxisAngle(camUp, dx * aimSense);
       curr.applyAxisAngle(camRight, -dy * aimSense);
       setVectorFromDir(curr);
       e.preventDefault();
@@ -1552,17 +1544,7 @@
         m.makeBasis(right, up, forward);
         const baseQuat = new THREE.Quaternion().setFromRotationMatrix(m);
         tars.mesh.setRotationFromQuaternion(baseQuat);
-        // Update sight transform to match TARS position and vector mode direction
-        if (sight && sight.visible) {
-          sight.position.copy(tars.mesh.position);
-          // Aim according to vector (payloadState.vecX,Y,Z) in world frame
-          const aim = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ);
-          if (aim.lengthSq() < 1e-12) aim.set(1, 0, 0);
-          aim.normalize();
-          // Convert world direction to local render coords (same here since we apply at mesh position)
-          const quat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), aim);
-          sight.setRotationFromQuaternion(quat);
-        }
+        
         // Spin geometry around spinNode's local Y so the disc remains vertical (tie to simulation time)
         tars.spinPhase = (tars.spinPhase + tars.spin * frameSimYears * YEAR_SECONDS) % (Math.PI * 2);
         const sn = tars.mesh.userData.spinNode;
