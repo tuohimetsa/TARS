@@ -1,0 +1,1657 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TARS Solar System Simulation</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #000; color: #eee; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol'; }
+    #hud {
+      position: fixed; left: 10px; top: 10px; z-index: 10; padding: 8px 10px;
+      background: rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.15); border-radius: 8px;
+      line-height: 1.2; font-size: 12px; white-space: pre; user-select: none; max-width: min(92vw, 720px);
+    }
+    #legend { position: fixed; right: 10px; bottom: 10px; z-index: 10; font-size: 11px; opacity: 0.8; }
+    a { color: #8ec7ff; text-decoration: none; }
+    .btnbar { margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap; align-items: center; white-space: normal; }
+    .btnbar .row { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; width: 100%; }
+    button { background: #1b1f2a; color: #e7eefc; border: 1px solid #2b3140; border-radius: 4px; padding: 3px 6px; cursor: pointer; font-size: 12px; }
+    button:active { transform: translateY(1px); }
+    select, input[type="number"], input[type="range"] { font-size: 12px; padding: 2px 4px; border-radius: 4px; border: 1px solid #2b3140; background: #0e1117; color: #e7eefc; }
+    input[type="range"] { width: 260px; }
+    .muted { opacity: 0.8; }
+    .ctrl-group { display: inline-grid; grid-template-columns: auto 260px 80px 200px; column-gap: 8px; align-items: center; font-size: 13px; }
+    .ctrl-group .row { grid-column: 1 / -1; margin-top: 4px; }
+    .ctrl-group .value { display: inline-block; width: 200px; font-variant-numeric: tabular-nums; }
+    .tabs { display: flex; gap: 6px; margin-top: 6px; }
+    .tab-btn { background: #0e1117; color: #e7eefc; border: 1px solid #2b3140; padding: 4px 8px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+    .tab-btn.active { background: #1b1f2a; border-color: #3a4153; }
+    .panel { display: none; margin-top: 6px; }
+    .panel.active { display: block; }
+  </style>
+</head>
+<body>
+  <div id="hud"></div>
+  <div id="legend">
+    Mouse: drag to orbit • right-drag to pan • wheel to zoom
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./vendor/three.module.js"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from './vendor/OrbitControls.js';
+    // ---------- High-level simulation parameters ----------
+    const AU = 1.0;                // Astronomical Unit in simulation units
+    const SCALE = 149597870.7;     // Render units per AU (1 unit = 1 km)
+    const YEAR_SECONDS = 365.25 * 24 * 3600; // seconds per Earth year
+    const REALTIME_YEARS_PER_SEC = 1 / YEAR_SECONDS; // 1x realtime = this many sim years per real second
+    const physics = {
+      muSun: 1.0,                  // AU^3 / year^2
+      maxDt: 1/3600,               // years
+      spinGainK: 0.8,              // spin-up gain scaling (higher near Sun)
+      spinDecay: 0.02,             // small natural decay
+      nBodyAttractors: true,       // include planetary gravity on craft/payloads
+      // Note: Only one Δv quantity conceptually exists now: payload exit velocity at release
+    };
+    // Trail sampling (to reduce jitter at low time scales)
+    const trailSampling = {
+      minYears: 1e-5,        // ~5.26 minutes of sim time
+      minDistanceKm: 10000   // 10,000 km between points
+    };
+    // Screen-space sampling to avoid jitter at close zoom
+    const trailScreenSampling = {
+      minPixels: 2
+    };
+    
+
+    // Energy system (arbitrary units)
+    // Deprecated constants replaced by physics object above
+
+    // ---------- THREE.js setup ----------
+    const epochReal = new Date(); // base real time for simulated datetime derivation
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+    // Floating render origin (km) to improve precision at large distances
+    const renderOrigin = new THREE.Vector3(0, 0, 0);
+    const RENDER_REANCHOR_KM = 5e8; // 500 million km (fewer re-centers)
+
+    const camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.01, 5e12);
+    camera.position.set(0, 3e6, 6e6);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.minDistance = 10; // 10 km
+    controls.maxDistance = 1e11; // 100 billion km ~ 667 AU
+
+    // ---------- Lighting and background ----------
+    const sunLight = new THREE.PointLight(0xffffff, 10, 0, 2);
+    sunLight.position.set(0, 0, 0);
+    scene.add(sunLight);
+
+    const ambient = new THREE.AmbientLight(0x404040, 0.4);
+    scene.add(ambient);
+
+    // Starfield
+    let starfieldMaterialRef = null;
+    function createStarfield(count = 2000, radius = 10000 * SCALE) {
+      const geometry = new THREE.BufferGeometry();
+      const positions = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        const phi = Math.acos(2 * Math.random() - 1);
+        const theta = 2 * Math.PI * Math.random();
+        const r = radius * (0.9 + 0.1 * Math.random());
+        positions[3*i+0] = r * Math.sin(phi) * Math.cos(theta);
+        positions[3*i+1] = r * Math.sin(phi) * Math.sin(theta);
+        positions[3*i+2] = r * Math.cos(phi);
+      }
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      const material = new THREE.PointsMaterial({ color: 0xffffff, size: 3, sizeAttenuation: true });
+      starfieldMaterialRef = material;
+      const stars = new THREE.Points(geometry, material);
+      stars.frustumCulled = false;
+      return stars;
+    }
+    const starfield = createStarfield();
+    scene.add(starfield);
+
+    // ---------- Bodies ----------
+    class Body {
+      constructor({ name, mass, radiusRender, color, semiMajorAU, initialPhase = 0, parent = null }) {
+        this.name = name;
+        this.mass = mass;               // in Sun mass units for planets? We'll only use Sun's mu for gravity.
+        this.radiusRender = radiusRender; // in render units
+        this.color = color;
+        this.parent = parent;           // Parent body (only Sun for our simplified model)
+
+        // State in AU and AU/year
+        const r = semiMajorAU;
+        const angle = initialPhase;
+        this.position = new THREE.Vector3(r * Math.cos(angle), 0, r * Math.sin(angle));
+      const vCircular = Math.sqrt(physics.muSun / r);
+        this.velocity = new THREE.Vector3(-vCircular * Math.sin(angle), 0, vCircular * Math.cos(angle));
+
+        // Visuals
+        const geom = new THREE.SphereGeometry(Math.max(0.5, radiusRender), 24, 16);
+        const mat = new THREE.MeshStandardMaterial({ color: this.color, emissive: 0x000000, metalness: 0.1, roughness: 0.8 });
+        this.mesh = new THREE.Mesh(geom, mat);
+        scene.add(this.mesh);
+      }
+
+      updateVisual() {
+        this.mesh.position.set(
+          this.position.x * SCALE - renderOrigin.x,
+          this.position.y * SCALE - renderOrigin.y,
+          this.position.z * SCALE - renderOrigin.z
+        );
+      }
+    }
+
+    function createSun() {
+      const sunGeom = new THREE.SphereGeometry(695700, 48, 32);
+      const sunTexture = new THREE.TextureLoader().load('https://i.imgur.com/fhPbfIs.jpeg');
+      const sunMat = new THREE.MeshBasicMaterial({ map: sunTexture });
+      const sun = new THREE.Mesh(sunGeom, sunMat);
+      sun.name = 'Sun';
+      sun.userData.baseRenderRadius = sunGeom.parameters.radius;
+      scene.add(sun);
+      return sun;
+    }
+
+    // Sun
+    const sun = createSun();
+
+    // Orbit guide helper (circles)
+    const orbitGuides = [];
+    function addOrbitGuide(radiusAU, color = 0xffffff, opacity = 0.07) {
+      const segments = 512;
+      const geometry = new THREE.BufferGeometry();
+      const positions = new Float32Array(segments * 3);
+      for (let i = 0; i < segments; i++) {
+        const a = (i / segments) * Math.PI * 2;
+        positions[3*i+0] = Math.cos(a) * radiusAU * SCALE;
+        positions[3*i+1] = 0;
+        positions[3*i+2] = Math.sin(a) * radiusAU * SCALE;
+      }
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      const material = new THREE.LineBasicMaterial({ color, transparent: true, opacity });
+      const line = new THREE.LineLoop(geometry, material);
+      scene.add(line);
+      return line;
+    }
+
+    // Planets with approximate semi-major axes (AU) and render radii (exaggerated)
+    const planets = [
+      { name: 'Mercury', color: 0xaaaaaa, a: 0.39, r: 2439.7 },
+      { name: 'Venus',   color: 0xffddaa, a: 0.72, r: 6051.8 },
+      { name: 'Earth',   color: 0x4488ff, a: 1.00, r: 6371.0 },
+      { name: 'Mars',    color: 0xff6644, a: 1.52, r: 3389.5 },
+      { name: 'Jupiter', color: 0xffcc99, a: 5.20, r: 69911 },
+      { name: 'Saturn',  color: 0xffeeaa, a: 9.58, r: 58232 },
+      { name: 'Uranus',  color: 0xaaffff, a: 19.2, r: 25362 },
+      { name: 'Neptune', color: 0x4477ff, a: 30.1, r: 24622 }
+    ].map((p, i) => {
+      const line = addOrbitGuide(p.a, p.color, 0.06);
+      orbitGuides.push(line);
+      const body = new Body({ name: p.name, mass: 1, radiusRender: p.r, color: p.color, semiMajorAU: p.a, initialPhase: Math.random() * Math.PI * 2, parent: 'Sun' });
+      body.mesh.userData.baseRenderRadius = p.r;
+      return body;
+    });
+
+    // Body lookup for focus
+    const nameToBody = { Sun: sun, TARS: null };
+    for (const p of planets) nameToBody[p.name] = p.mesh;
+
+    // Saturn ring (visual only)
+    const saturnIndex = planets.findIndex(p => p.name === 'Saturn');
+    if (saturnIndex >= 0) {
+      const saturn = planets[saturnIndex];
+      const ringGeom = new THREE.RingGeometry(3.6 + 1.2, 3.6 + 2.4, 64);
+      const ringMat = new THREE.MeshBasicMaterial({ color: 0xd9c8a0, side: THREE.DoubleSide, transparent: true, opacity: 0.7 });
+      const ring = new THREE.Mesh(ringGeom, ringMat);
+      ring.rotation.x = Math.PI / 2.1;
+      saturn.mesh.add(ring);
+    }
+
+    // ---------- Simplified gravity (Sun-planet only) ----------
+    function sunAccelAUPerYr2(posAU) {
+      const r2 = posAU.lengthSq();
+      const r = Math.sqrt(r2) + 1e-12;
+      return posAU.clone().multiplyScalar(-physics.muSun / (r*r*r));
+    }
+    function nBodyAccelAUPerYr2(posAU) {
+      // Sun term
+      const a = sunAccelAUPerYr2(posAU);
+      if (!physics.nBodyAttractors) return a;
+      // Planetary terms: position of planet relative to Sun is planets[i].position
+      for (const p of planets) {
+        const m = planetMassRatio[p.name];
+        if (!m) continue;
+        const rVec = posAU.clone().sub(p.position);
+        const r2 = rVec.lengthSq();
+        const r = Math.sqrt(r2) + 1e-12;
+        // accel = -G Msun mPlanet / r^3 * rhat → here muSun * mPlanet
+        a.add(rVec.multiplyScalar(-physics.muSun * m / (r*r*r)));
+      }
+      return a;
+    }
+    function integrateSunGravityVerletBody(body, dtYears) {
+      // Velocity-Verlet for better energy conservation
+      const a0 = sunAccelAUPerYr2(body.position.clone());
+      body.velocity.addScaledVector(a0, dtYears * 0.5);
+      body.position.addScaledVector(body.velocity, dtYears);
+      const a1 = sunAccelAUPerYr2(body.position.clone());
+      body.velocity.addScaledVector(a1, dtYears * 0.5);
+    }
+
+    // ---------- TARS spacecraft (procedural) ----------
+    function createTARS() {
+      const root = new THREE.Group();
+      const spinNode = new THREE.Group();
+      root.add(spinNode);
+
+      // Dimensions
+      // Set a plausible physical size for the TARS disc in km (visual only)
+      const radius = 0.1;    // 100 meters ~ 0.1 km
+      const thickness = 0.02; // 20 meters ~ 0.02 km
+
+      // Geometry container so we can re-orient the disc relative to the spin node
+      const geo = new THREE.Group();
+      spinNode.add(geo);
+
+      // Side wall of the disc (gray)
+      const sideGeom = new THREE.CylinderGeometry(radius, radius, thickness, 64, 1, true);
+      const sideMat = new THREE.MeshStandardMaterial({ color: 0x777777, metalness: 0.4, roughness: 0.6 });
+      const side = new THREE.Mesh(sideGeom, sideMat);
+      geo.add(side);
+
+      // Top and bottom halves (black / white)
+      const halfA = new THREE.Mesh(
+        new THREE.CircleGeometry(radius, 64, 0, Math.PI),
+        new THREE.MeshStandardMaterial({ color: 0x111111, metalness: 0.2, roughness: 0.9 })
+      );
+      const halfB = new THREE.Mesh(
+        new THREE.CircleGeometry(radius, 64, Math.PI, Math.PI),
+        new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 0.2, roughness: 0.9 })
+      );
+      const top = new THREE.Group();
+      halfA.rotation.x = -Math.PI / 2;
+      halfB.rotation.x = -Math.PI / 2;
+      halfA.position.y = thickness / 2;
+      halfB.position.y = thickness / 2;
+      top.add(halfA); top.add(halfB);
+      geo.add(top);
+
+      // Bottom mirrors
+      const halfA2 = halfA.clone(); halfA2.material = halfA.material.clone();
+      const halfB2 = halfB.clone(); halfB2.material = halfB.material.clone();
+      halfA2.rotation.x = Math.PI / 2;
+      halfB2.rotation.x = Math.PI / 2;
+      halfA2.position.y = -thickness / 2;
+      halfB2.position.y = -thickness / 2;
+      const bottom = new THREE.Group(); bottom.add(halfA2); bottom.add(halfB2);
+      geo.add(bottom);
+
+      // Make the disc an oval by non-uniform scaling
+      geo.scale.set(1.8, 1.0, 1.1);
+
+      // Subtle emissive seam along the color divide (optional visual)
+      const seam = new THREE.Mesh(new THREE.PlaneGeometry(2 * radius, thickness * 1.05), new THREE.MeshBasicMaterial({ color: 0x222222 }));
+      seam.rotation.y = Math.PI / 2;
+      geo.add(seam);
+
+      // Keep disc HORIZONTAL relative to spinNode (normal along local Y)
+      geo.rotation.x = 0;
+      geo.rotation.y = 0;
+      geo.rotation.z = Math.PI/2;
+
+      // Axis helper (hidden by default)
+      const axis = new THREE.AxesHelper(2.0); axis.visible = false; root.add(axis);
+      root.userData.spinNode = spinNode;
+      return root;
+    }
+
+    const tars = {
+      name: 'TARS',
+      // Physical state in AU and AU/year
+      position: new THREE.Vector3(1.0, 0, 0.01), // near Earth's orbit
+      velocity: new THREE.Vector3(0, 0, 0),
+      lastExitVelocityMps: 0.0,
+      spin: 0.0, // radians per second (visual)
+      spinPhase: 0.0, // accumulated radians for visual rotation
+      mesh: createTARS()
+    };
+    scene.add(tars.mesh);
+    nameToBody.TARS = tars.mesh;
+
+    // ---------- Object registry: payloads & markers ----------
+    const simObjects = {
+      payloads: [], // { id, position(AU), velocity(AU/yr), mesh, label, trail, color }
+      markers: []   // { id, position(AU), mesh, label }
+    };
+    let nextObjectId = 1;
+
+    function integrateSunGravityVecVerlet(positionAU, velocityAUPerYr, dtYears) {
+      const a0 = nBodyAccelAUPerYr2(positionAU.clone());
+      velocityAUPerYr.addScaledVector(a0, dtYears * 0.5);
+      positionAU.addScaledVector(velocityAUPerYr, dtYears);
+      const a1 = nBodyAccelAUPerYr2(positionAU.clone());
+      velocityAUPerYr.addScaledVector(a1, dtYears * 0.5);
+    }
+
+    function createSmallTrail(maxPoints, color) {
+      const positions = new Float32Array(maxPoints * 3);
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geometry.setDrawRange(0, 0);
+      const material = new THREE.LineDashedMaterial({ color, transparent: true, opacity: 0.7, dashSize: 2, gapSize: 1 });
+      const line = new THREE.Line(geometry, material);
+      line.computeLineDistances();
+      line.frustumCulled = false;
+      return { line, positions, geometry, maxPoints, count: 0 };
+    }
+    const tarsTrail = createTrail(2000, 0x66ccff);
+    scene.add(tarsTrail.line);
+    // Add head connector for TARS trail
+    if (tarsTrail.headLine) scene.add(tarsTrail.headLine);
+
+    function appendToSmallTrail(trail, posWorld) {
+      const { positions, maxPoints } = trail;
+      if (trail.count < maxPoints) {
+        const idx = trail.count;
+        positions[idx*3+0] = posWorld.x;
+        positions[idx*3+1] = posWorld.y;
+        positions[idx*3+2] = posWorld.z;
+        trail.count++;
+      } else {
+        positions.copyWithin(0, 3);
+        positions[positions.length-3] = posWorld.x;
+        positions[positions.length-2] = posWorld.y;
+        positions[positions.length-1] = posWorld.z;
+      }
+      trail.geometry.attributes.position.needsUpdate = true;
+      trail.geometry.setDrawRange(0, trail.count);
+    }
+
+    function spawnPayload(init) {
+      const id = `payload_${nextObjectId++}`;
+      const color = init.color != null ? init.color : 0x66ff88;
+      const geom = new THREE.SphereGeometry(0.4, 16, 12);
+      const mat = new THREE.MeshStandardMaterial({ color, emissive: 0x001100, metalness: 0.1, roughness: 0.7 });
+      const mesh = new THREE.Mesh(geom, mat);
+      scene.add(mesh);
+      const label = createLabelSprite('Payload');
+      label.position.set(0, 1.2, 0);
+      label.visible = state.showLabels;
+      mesh.add(label);
+
+      const payload = {
+        id,
+        position: init.position.clone(),
+        velocity: init.velocity.clone(),
+        mesh,
+        label,
+        color,
+        trail: createTrail(600, color)
+      };
+      scene.add(payload.trail.line);
+      payload.trail.line.visible = state.showTrails;
+      if (payload.trail.headLine) {
+        scene.add(payload.trail.headLine);
+        payload.trail.headLine.visible = state.showTrails;
+      }
+      simObjects.payloads.push(payload);
+      return id;
+    }
+
+    function spawnMarker(init) {
+      const id = `marker_${nextObjectId++}`;
+      const color = init.color != null ? init.color : 0xffaa00;
+      const geom = new THREE.SphereGeometry(0.25, 12, 10);
+      const mat = new THREE.MeshBasicMaterial({ color });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.position.set(init.position.x * SCALE, init.position.y * SCALE, init.position.z * SCALE);
+      scene.add(mesh);
+      const label = createLabelSprite(init.label || 'Target');
+      label.position.set(0, 0.9, 0);
+      label.visible = state.showLabels;
+      mesh.add(label);
+      const marker = { id, position: init.position.clone(), mesh, label };
+      simObjects.markers.push(marker);
+      return id;
+    }
+
+    function despawnById(id) {
+      const pIdx = simObjects.payloads.findIndex(o => o.id === id);
+      if (pIdx >= 0) {
+        const p = simObjects.payloads[pIdx];
+        scene.remove(p.mesh);
+        scene.remove(p.trail.line);
+        p.mesh.geometry.dispose(); p.mesh.material.dispose();
+        simObjects.payloads.splice(pIdx, 1);
+        return true;
+      }
+      const mIdx = simObjects.markers.findIndex(o => o.id === id);
+      if (mIdx >= 0) {
+        const m = simObjects.markers[mIdx];
+        scene.remove(m.mesh);
+        m.mesh.geometry.dispose(); m.mesh.material.dispose();
+        simObjects.markers.splice(mIdx, 1);
+        return true;
+      }
+      return false;
+    }
+
+    function updatePayloads(dtYears) {
+      for (const p of simObjects.payloads) {
+        integrateSunGravityVecVerlet(p.position, p.velocity, dtYears);
+      }
+    }
+
+    // TARS trail
+    function createTrail(maxPoints, color) {
+      // Main trail polyline (stored in local coordinates relative to an anchor)
+      const positions = new Float32Array(maxPoints * 3);
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geometry.setDrawRange(0, 0);
+      const material = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.7 });
+      const line = new THREE.Line(geometry, material);
+      line.frustumCulled = false;
+
+      // Head connector: from last trail point to current position (also local coordinates)
+      const headPositions = new Float32Array(2 * 3);
+      const headGeometry = new THREE.BufferGeometry();
+      headGeometry.setAttribute('position', new THREE.BufferAttribute(headPositions, 3));
+      headGeometry.setDrawRange(0, 0);
+      const headMaterial = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.9 });
+      const headLine = new THREE.Line(headGeometry, headMaterial);
+      headLine.frustumCulled = false;
+
+      return {
+        line,
+        positions,
+        geometry,
+        maxPoints,
+        count: 0,
+        headLine,
+        headPositions,
+        headGeometry,
+        // floating origin anchor in km, to keep vertex coordinates near zero
+        anchor: new THREE.Vector3(0, 0, 0),
+        anchorInitialized: false,
+        reanchorDistanceKm: 5e7 // 50 million km
+      };
+    }
+    function appendToTrail(trail, v3WorldKm) {
+      // Initialize anchor at first point
+      if (!trail.anchorInitialized) {
+        trail.anchor.copy(v3WorldKm);
+        trail.line.position.copy(trail.anchor);
+        if (trail.headLine) trail.headLine.position.copy(trail.anchor);
+        trail.anchorInitialized = true;
+      }
+      // Re-anchor if distance from anchor grows too large
+      let offset = new THREE.Vector3().copy(v3WorldKm).sub(trail.anchor);
+      if (offset.length() > (trail.reanchorDistanceKm || 5e7)) {
+        const delta = new THREE.Vector3().copy(v3WorldKm).sub(trail.anchor);
+        trail.anchor.copy(v3WorldKm);
+        trail.line.position.copy(trail.anchor);
+        if (trail.headLine) trail.headLine.position.copy(trail.anchor);
+        // Shift existing vertices by -delta to keep them near origin
+        for (let i = 0; i < trail.count; i++) {
+          const j = i * 3;
+          trail.positions[j+0] -= delta.x;
+          trail.positions[j+1] -= delta.y;
+          trail.positions[j+2] -= delta.z;
+        }
+        if (trail.headPositions && trail.headGeometry.drawRange.count > 0) {
+          trail.headPositions[0] -= delta.x;
+          trail.headPositions[1] -= delta.y;
+          trail.headPositions[2] -= delta.z;
+        }
+        // Recompute local offset relative to new anchor
+        offset.set(0, 0, 0);
+      }
+      const { positions, maxPoints } = trail;
+      // Optional screen-space sampling: skip if projected movement is tiny
+      if (trailScreenSampling && camera && renderer && trail.count > 0) {
+        const lastIdx = (trail.count - 1) * 3;
+        const lastLocal = new THREE.Vector3(
+          positions[lastIdx+0], positions[lastIdx+1], positions[lastIdx+2]
+        );
+        const currLocal = offset.clone();
+        const lastWorld = lastLocal.clone().add(trail.anchor);
+        const currWorld = currLocal.clone().add(trail.anchor);
+        const lastNdc = lastWorld.clone().project(camera);
+        const currNdc = currWorld.clone().project(camera);
+        const w = renderer.domElement.width, h = renderer.domElement.height;
+        const lastPx = new THREE.Vector2((lastNdc.x * 0.5 + 0.5) * w, ( -lastNdc.y * 0.5 + 0.5) * h);
+        const currPx = new THREE.Vector2((currNdc.x * 0.5 + 0.5) * w, ( -currNdc.y * 0.5 + 0.5) * h);
+        if (lastPx.distanceTo(currPx) < (trailScreenSampling.minPixels || 2)) {
+          // Still update head connector, but skip adding a new vertex
+          if (trail.headPositions && trail.count > 0) {
+            const hp = trail.headPositions;
+            hp[0] = positions[lastIdx+0];
+            hp[1] = positions[lastIdx+1];
+            hp[2] = positions[lastIdx+2];
+            hp[3] = currLocal.x;
+            hp[4] = currLocal.y;
+            hp[5] = currLocal.z;
+            trail.headGeometry.attributes.position.needsUpdate = true;
+            trail.headGeometry.setDrawRange(0, 2);
+          }
+          return;
+        }
+      }
+      if (trail.count < maxPoints) {
+        const idx = trail.count;
+        positions[idx*3+0] = offset.x;
+        positions[idx*3+1] = offset.y;
+        positions[idx*3+2] = offset.z;
+        trail.count++;
+      } else {
+        positions.copyWithin(0, 3);
+        positions[positions.length-3] = offset.x;
+        positions[positions.length-2] = offset.y;
+        positions[positions.length-1] = offset.z;
+      }
+      trail.geometry.attributes.position.needsUpdate = true;
+      trail.geometry.setDrawRange(0, trail.count);
+    }
+
+    // ---------- Trajectory preview (payload) ----------
+    function createPreviewLine(maxPoints, color) {
+      const positions = new Float32Array(maxPoints * 3);
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geometry.setDrawRange(0, 0);
+      const material = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.8 });
+      const line = new THREE.Line(geometry, material);
+      line.frustumCulled = false;
+      return { line, positions, geometry, maxPoints };
+    }
+    const preview = {
+      enabled: false,
+      horizonYears: 0.5, // ~6 months
+      steps: 300,
+      dirty: true,
+      payload: createPreviewLine(2000, 0x44ff77)
+    };
+    scene.add(preview.payload.line);
+    preview.payload.line.visible = false;
+
+    function computePayloadPreview() {
+      const positions = preview.payload.positions;
+      const steps = Math.max(2, Math.min(preview.steps, preview.payload.maxPoints));
+      const dt = preview.horizonYears / (steps - 1);
+      // Start from TARS with hypothetical release DV (vector-only)
+      const startPos = tars.position.clone();
+      const dir = new THREE.Vector3(-payloadState.vecX, payloadState.vecY, payloadState.vecZ).normalize();
+      const dvAUPerYr = mpsToAUPerYr(payloadState.dvMag);
+      const startVel = tars.velocity.clone().addScaledVector(dir, dvAUPerYr);
+      let p = startPos.clone();
+      let v = startVel.clone();
+      // Snapshot planet states (position in AU) and integrate them for consistent N-body preview
+      const planetStates = planets.map(pl => ({ name: pl.name, pos: pl.position.clone(), vel: pl.velocity.clone() }));
+      function localAccel(posAU) {
+        // Sun term
+        const r2 = posAU.lengthSq();
+        const r = Math.sqrt(r2) + 1e-12;
+        const a = posAU.clone().multiplyScalar(-physics.muSun / (r*r*r));
+        if (!physics.nBodyAttractors) return a;
+        for (const st of planetStates) {
+          const m = planetMassRatio[st.name]; if (!m) continue;
+          const rp = posAU.clone().sub(st.pos);
+          const r2p = rp.lengthSq();
+          const rpLen = Math.sqrt(r2p) + 1e-12;
+          a.add(rp.multiplyScalar(-physics.muSun * m / (rpLen*rpLen*rpLen)));
+        }
+        return a;
+      }
+      for (let i = 0; i < steps; i++) {
+        // write world positions in render units
+        positions[i*3+0] = p.x * SCALE;
+        positions[i*3+1] = p.y * SCALE;
+        positions[i*3+2] = p.z * SCALE;
+        // advance one step with velocity-Verlet using local N-body accel
+        const a0 = localAccel(p.clone());
+        v.addScaledVector(a0, dt * 0.5);
+        p.addScaledVector(v, dt);
+        const a1 = localAccel(p.clone());
+        v.addScaledVector(a1, dt * 0.5);
+        // advance planet states with Sun gravity only (planet-planet neglected as in main sim)
+        for (const st of planetStates) {
+          const a0p = sunAccelAUPerYr2(st.pos.clone());
+          st.vel.addScaledVector(a0p, dt * 0.5);
+          st.pos.addScaledVector(st.vel, dt);
+          const a1p = sunAccelAUPerYr2(st.pos.clone());
+          st.vel.addScaledVector(a1p, dt * 0.5);
+        }
+      }
+      preview.payload.geometry.attributes.position.needsUpdate = true;
+      preview.payload.geometry.setDrawRange(0, steps);
+      preview.dirty = false;
+    }
+
+    function updateTars(dtYears) {
+      // Gravity from Sun (Velocity-Verlet)
+      const a0 = nBodyAccelAUPerYr2(tars.position.clone());
+      tars.velocity.addScaledVector(a0, dtYears * 0.5);
+      tars.position.addScaledVector(tars.velocity, dtYears);
+      const a1 = nBodyAccelAUPerYr2(tars.position.clone());
+      tars.velocity.addScaledVector(a1, dtYears * 0.5);
+
+      // Spin gain from solar irradiance ~ 1 / r^2
+      const rLen = Math.max(1e-12, tars.position.length());
+      const spinGain = physics.spinGainK * dtYears / (rLen * rLen);
+      if (spinGain > 0) tars.spin += spinGain;
+      // Natural spin decay
+      tars.spin = Math.max(0, tars.spin - physics.spinDecay * dtYears);
+
+      // No Δv reserve in this model; payload exit velocity at release is the single Δv quantity tracked
+
+      // Visual placement handled per-frame in animate() with smoothing
+      // Orientation and visual spin are applied once per frame in the main loop
+    }
+
+    // Initialize TARS orbital velocity for near-circular orbit at its radius
+    (function initTarsVelocity() {
+      const r = Math.sqrt(tars.position.lengthSq());
+      const v = Math.sqrt(physics.muSun / r);
+      // Tangential to radius in +theta direction
+      const dir = new THREE.Vector3(-tars.position.z, 0, tars.position.x).normalize();
+      tars.velocity.copy(dir.multiplyScalar(v));
+    })();
+
+    // ---------- HUD ----------
+    const hud = document.getElementById('hud');
+    const hudStats = document.createElement('div');
+    hud.appendChild(hudStats);
+    const hudMsg = document.createElement('div');
+    hudMsg.style.marginTop = '6px';
+    hudMsg.style.color = '#ffd166';
+    hudMsg.style.fontStyle = 'italic';
+    hud.appendChild(hudMsg);
+    function flashHudMessage(msg) {
+      hudMsg.textContent = msg;
+      clearTimeout(hudMsg._t);
+      hudMsg._t = setTimeout(() => { hudMsg.textContent = ''; }, 1200);
+    }
+    const state = {
+      simYears: 0,
+      paused: false,
+      followTARS: true,
+      followOffset: null,
+      prevFollowTarget: null,
+      showOrbits: true,
+      showStarfield: true,
+      showLabels: true,
+      showTrails: true,
+      timeScaleMultiplier: 100, // 100x realtime by default
+      timeScaleYearsPerSec: 100 * REALTIME_YEARS_PER_SEC,
+      focus: 'TARS'
+    };
+
+    function updateHUD() {
+      const r = Math.sqrt(tars.position.lengthSq());
+      const realNow = new Date();
+      const simMillis = epochReal.getTime() + state.simYears * YEAR_SECONDS * 1000;
+      const simDate = new Date(simMillis);
+      const tipScale = (typeof payloadState !== 'undefined' && payloadState && Number.isFinite(payloadState.tipScaleMSPerRad)) ? payloadState.tipScaleMSPerRad : 10;
+      const tipSpeedMps = Math.max(0, tars.spin) * tipScale;
+      hudStats.textContent =
+        `Real time: ${realNow.toLocaleString()}\n` +
+        `Sim time: ${simDate.toLocaleString()} (Δ ${state.simYears.toFixed(2)} years)\n` +
+        `TARS @ ${r.toFixed(3)} AU\n` +
+        `Exit velocity (last): ${tars.lastExitVelocityMps.toFixed(2)} m/s\n` +
+        `Tip speed: ${tipSpeedMps.toFixed(1)} m/s\n` +
+        `Spin: ${tars.spin.toFixed(3)} rad/s\n` +
+        `Time scale: ${state.timeScaleMultiplier.toLocaleString()}x realtime (${state.timeScaleYearsPerSec.toExponential(3)} y/s)\n` +
+        `Focus: ${state.focus}`;
+    }
+
+    // Buttons
+    const tabs = document.createElement('div'); tabs.className = 'tabs';
+    const tabControls = document.createElement('button'); tabControls.className = 'tab-btn active'; tabControls.textContent = 'Controls';
+    const tabPhysics = document.createElement('button'); tabPhysics.className = 'tab-btn'; tabPhysics.textContent = 'Physics';
+    const tabGraphics = document.createElement('button'); tabGraphics.className = 'tab-btn'; tabGraphics.textContent = 'Graphics';
+    const tabLaunch = document.createElement('button'); tabLaunch.className = 'tab-btn'; tabLaunch.textContent = 'Launch Payload';
+    tabs.appendChild(tabControls); tabs.appendChild(tabPhysics); tabs.appendChild(tabGraphics); tabs.appendChild(tabLaunch);
+    hud.appendChild(tabs);
+
+    const panelControls = document.createElement('div'); panelControls.className = 'panel active';
+    const panelPhysics = document.createElement('div'); panelPhysics.className = 'panel';
+    const panelGraphics = document.createElement('div'); panelGraphics.className = 'panel';
+    const panelLaunch = document.createElement('div'); panelLaunch.className = 'panel';
+    hud.appendChild(panelControls);
+    hud.appendChild(panelPhysics);
+    hud.appendChild(panelGraphics);
+    hud.appendChild(panelLaunch);
+
+    const btnBar = document.createElement('div');
+    btnBar.className = 'btnbar';
+    const btnStart = document.createElement('button'); btnStart.textContent = 'Start';
+    const btnPause = document.createElement('button'); btnPause.textContent = 'Pause';
+    const btnStop = document.createElement('button'); btnStop.textContent = 'Stop';
+    const btnFollow = document.createElement('button'); btnFollow.textContent = 'Follow On/Off';
+    const btnFaster = document.createElement('button'); btnFaster.textContent = 'Faster';
+    const btnSlower = document.createElement('button'); btnSlower.textContent = 'Slower';
+    const btnSpin = document.createElement('button'); btnSpin.textContent = 'Boost Spin';
+    const btnOrbits = document.createElement('button'); btnOrbits.textContent = 'Toggle Orbits';
+    const btnStars = document.createElement('button'); btnStars.textContent = 'Toggle Stars';
+    const btnLabels = document.createElement('button'); btnLabels.textContent = 'Toggle Labels';
+    const btnTrails = document.createElement('button'); btnTrails.textContent = 'Toggle Trails';
+    const btnResetView = document.createElement('button'); btnResetView.textContent = 'Reset View';
+
+    // Time slider
+    const speedWrap = document.createElement('div');
+    const speedLabel = document.createElement('span'); speedLabel.textContent = 'Scale:';
+    const speedValue = document.createElement('span'); speedValue.className = 'muted value';
+    const speedInput = document.createElement('input'); speedInput.type = 'range'; speedInput.min = '0'; speedInput.max = '9'; speedInput.step = '0.01'; speedInput.value = String(Math.log10(state.timeScaleMultiplier));
+    const speedNumber = document.createElement('input'); speedNumber.type = 'number'; speedNumber.min = '1'; speedNumber.max = '1000000000'; speedNumber.step = '1'; speedNumber.value = String(state.timeScaleMultiplier); speedNumber.style.width = '90px';
+    const speedGroup = document.createElement('div'); speedGroup.className = 'ctrl-group';
+    speedGroup.appendChild(speedLabel); speedGroup.appendChild(speedInput); speedGroup.appendChild(speedNumber); speedGroup.appendChild(speedValue);
+    speedWrap.appendChild(speedGroup);
+
+    // Focus selector
+    const focusSelect = document.createElement('select');
+    for (const name of ['TARS', 'Sun', 'Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune']) {
+      const opt = document.createElement('option'); opt.value = name; opt.textContent = name; if (name === state.focus) opt.selected = true; focusSelect.appendChild(opt);
+    }
+
+    // Thrust controls
+    const thrustWrap = document.createElement('div');
+    const thrustLabel = document.createElement('span'); thrustLabel.textContent = 'Thrust:';
+    const mkBtn = (txt) => { const b = document.createElement('button'); b.textContent = txt; return b; };
+    const btnProg = mkBtn('Prograde');
+    const btnRetro = mkBtn('Retrograde');
+    const btnRadOut = mkBtn('Radial Out');
+    const btnRadIn = mkBtn('Radial In');
+    const btnNormUp = mkBtn('Normal +');
+    const btnNormDn = mkBtn('Normal -');
+    const btnResetTars = mkBtn('Reset TARS');
+    thrustWrap.appendChild(thrustLabel);
+    thrustWrap.appendChild(btnProg); thrustWrap.appendChild(btnRetro);
+    thrustWrap.appendChild(btnRadOut); thrustWrap.appendChild(btnRadIn);
+    thrustWrap.appendChild(btnNormUp); thrustWrap.appendChild(btnNormDn);
+    thrustWrap.appendChild(btnResetTars);
+
+    // Assemble controls
+    const row1 = document.createElement('div'); row1.className = 'row';
+    row1.appendChild(btnStart); row1.appendChild(btnPause); row1.appendChild(btnStop); row1.appendChild(btnFollow); row1.appendChild(btnResetView);
+    const row2 = document.createElement('div'); row2.className = 'row';
+    row2.appendChild(btnFaster); row2.appendChild(btnSlower); row2.appendChild(btnSpin); row2.appendChild(focusSelect);
+    const row3 = document.createElement('div'); row3.className = 'row';
+    row3.appendChild(btnOrbits); row3.appendChild(btnStars); row3.appendChild(btnLabels); row3.appendChild(btnTrails);
+    btnBar.appendChild(row1);
+    btnBar.appendChild(row2);
+    btnBar.appendChild(row3);
+    btnBar.appendChild(speedWrap);
+    btnBar.appendChild(thrustWrap);
+    panelControls.appendChild(btnBar);
+
+    // Physics panel UI
+    const physForm = document.createElement('div'); physForm.className = 'btnbar';
+    function makeField(label, key, step, min, max) {
+      const row = document.createElement('div'); row.className = 'row';
+      const lbl = document.createElement('label'); lbl.textContent = label;
+      const input = document.createElement('input'); input.type = 'number'; input.step = String(step); if (min != null) input.min = String(min); if (max != null) input.max = String(max);
+      input.value = String(physics[key]); input.style.width = '120px';
+      input.onchange = () => { const v = parseFloat(input.value); if (!Number.isFinite(v)) return; physics[key] = v; };
+      row.appendChild(lbl); row.appendChild(input);
+      return row;
+    }
+    physForm.appendChild(makeField('muSun (AU^3/yr^2)', 'muSun', 0.001, 0.0001));
+    physForm.appendChild(makeField('maxDt (yr)', 'maxDt', 0.0001, 0.00001));
+    physForm.appendChild(makeField('spinGainK', 'spinGainK', 0.01, 0));
+    physForm.appendChild(makeField('spinDecay', 'spinDecay', 0.001, 0));
+    // N-body toggle
+    const nBodyRow = document.createElement('div'); nBodyRow.className = 'row';
+    const nBodyLbl = document.createElement('label'); nBodyLbl.textContent = 'N-body (planets attract craft/payloads)';
+    const nBodyChk = document.createElement('input'); nBodyChk.type = 'checkbox'; nBodyChk.checked = physics.nBodyAttractors;
+    nBodyChk.onchange = ()=> { physics.nBodyAttractors = nBodyChk.checked; };
+    nBodyRow.appendChild(nBodyLbl); nBodyRow.appendChild(nBodyChk);
+    physForm.appendChild(nBodyRow);
+    // No additional Δv reserves controls: only payload exit velocity is tracked
+    panelPhysics.appendChild(physForm);
+
+    // ---------- Graphics panel UI ----------
+    const gfxForm = document.createElement('div'); gfxForm.className = 'btnbar';
+    function makeGfxSlider(label, min, max, step, initial, onChange) {
+      const row = document.createElement('div'); row.className = 'row';
+      const lbl = document.createElement('label'); lbl.textContent = label;
+      const rng = document.createElement('input'); rng.type = 'range'; rng.min=String(min); rng.max=String(max); rng.step=String(step); rng.value=String(initial);
+      const val = document.createElement('span'); val.className='value muted'; val.textContent = String(initial);
+      rng.oninput = ()=>{ val.textContent = rng.value; onChange(parseFloat(rng.value)); };
+      row.appendChild(lbl); row.appendChild(rng); row.appendChild(val);
+      return row;
+    }
+    // Sun light intensity
+    gfxForm.appendChild(makeGfxSlider('Sun light', 0, 50, 0.5, sunLight.intensity, (v)=>{ sunLight.intensity = v; }));
+    // Ambient intensity
+    gfxForm.appendChild(makeGfxSlider('Ambient', 0, 2, 0.05, ambient.intensity, (v)=>{ ambient.intensity = v; }));
+    // Star size
+    gfxForm.appendChild(makeGfxSlider('Star size', 0.5, 6, 0.1, (starfield.material.size||3), (v)=>{ if (starfield.material) { starfield.material.size = v; starfield.material.needsUpdate = true; } }));
+    // Orbit guide opacity
+    const initialOrbitOpacity = (orbitGuides[0] && orbitGuides[0].material && orbitGuides[0].material.opacity) || 0.06;
+    gfxForm.appendChild(makeGfxSlider('Orbit opacity', 0, 1, 0.02, initialOrbitOpacity, (v)=>{ for (const l of orbitGuides) { if (l.material && l.material.transparent) l.material.opacity = v; } }));
+    // Background color
+    const bgRow = document.createElement('div'); bgRow.className='row';
+    const bgLbl = document.createElement('label'); bgLbl.textContent = 'Background';
+    const bgInput = document.createElement('input'); bgInput.type='color'; bgInput.value='#000000';
+    bgInput.onchange = ()=>{ const c = new THREE.Color(bgInput.value); scene.background = c; };
+    bgRow.appendChild(bgLbl); bgRow.appendChild(bgInput);
+    gfxForm.appendChild(bgRow);
+    panelGraphics.appendChild(gfxForm);
+
+    // ---------- True scale sizes (1:1 proportions) ----------
+    const KM_PER_AU = 149597870.7;
+    const planetRadiusKm = {
+      Sun: 695700,
+      Mercury: 2439.7,
+      Venus: 6051.8,
+      Earth: 6371.0,
+      Mars: 3389.5,
+      Jupiter: 69911,
+      Saturn: 58232,
+      Uranus: 25362,
+      Neptune: 24622
+    };
+    // Approx planet mass ratios (Mplanet / MSun)
+    const planetMassRatio = {
+      Mercury: 1.651e-7,
+      Venus:   2.447e-6,
+      Earth:   3.003e-6,
+      Mars:    3.227e-7,
+      Jupiter: 9.5479e-4,
+      Saturn:  2.858e-4,
+      Uranus:  4.366e-5,
+      Neptune: 5.151e-5
+    };
+    function desiredRenderRadiusUnits(name) {
+      const km = planetRadiusKm[name];
+      if (!km) return null;
+      const rAU = km / KM_PER_AU;
+      return rAU * SCALE;
+    }
+    function applyTrueScaleSizes(enabled) {
+      // Sun
+      const sunBase = sun.userData.baseRenderRadius || 10;
+      const sunDesired = desiredRenderRadiusUnits('Sun');
+      const sunScale = enabled && sunDesired ? (sunDesired / sunBase) : 1;
+      sun.scale.setScalar(sunScale);
+      // Planets
+      for (const p of planets) {
+        const base = p.mesh.userData.baseRenderRadius || 1;
+        const want = desiredRenderRadiusUnits(p.name);
+        const s = enabled && want ? (want / base) : 1;
+        p.mesh.scale.setScalar(Math.max(s, 1e-3));
+        // keep labels above surface
+        if (p.label) {
+          const labelHeight = Math.max(1.8, (base * s) + 1.0);
+          p.label.position.set(0, labelHeight, 0);
+        }
+      }
+    }
+    const trueScaleRow = document.createElement('div'); trueScaleRow.className = 'row';
+    const trueScaleLbl = document.createElement('label'); trueScaleLbl.textContent = 'True scale sizes (proportional)';
+    const trueScaleChk = document.createElement('input'); trueScaleChk.type = 'checkbox'; trueScaleChk.checked = true;
+    trueScaleChk.onchange = ()=> applyTrueScaleSizes(trueScaleChk.checked);
+    trueScaleRow.appendChild(trueScaleLbl); trueScaleRow.appendChild(trueScaleChk);
+    gfxForm.appendChild(trueScaleRow);
+    // apply once on load
+    applyTrueScaleSizes(trueScaleChk.checked);
+
+    // ---------- Launch Payload panel (combined) ----------
+    const payloadForm = document.createElement('div'); payloadForm.className = 'btnbar';
+    const payloadState = {
+      dvMag: 100,       // m/s
+      vecX: 1, vecY: 0, vecZ: 0 // vector components in world frame (normalized when used)
+    };
+    function rowWrap(...nodes) { const r = document.createElement('div'); r.className = 'row'; nodes.forEach(n => r.appendChild(n)); return r; }
+    const modeSel = document.createElement('span'); modeSel.textContent = 'Mode: vector';
+    const dvLbl = document.createElement('label'); dvLbl.textContent = 'Δv (m/s)';
+    const dvInput = document.createElement('input'); dvInput.type='number'; dvInput.step='1'; dvInput.value=String(payloadState.dvMag);
+    dvInput.onchange = ()=> { const v = parseFloat(dvInput.value)||0; payloadState.dvMag = v; preview.dirty = true; };
+    // Custom vector inputs (visible in vector mode)
+    const vecX = document.createElement('input'); vecX.type='number'; vecX.step='0.1'; vecX.value=String(payloadState.vecX);
+    const vecY = document.createElement('input'); vecY.type='number'; vecY.step='0.1'; vecY.value=String(payloadState.vecY);
+    const vecZ = document.createElement('input'); vecZ.type='number'; vecZ.step='0.1'; vecZ.value=String(payloadState.vecZ);
+    [vecX, vecY, vecZ].forEach((el, idx)=>{ el.style.width='60px'; el.oninput=()=>{ const v=parseFloat(el.value)||0; if(idx===0) payloadState.vecX=v; if(idx===1) payloadState.vecY=v; if(idx===2) payloadState.vecZ=v; preview.dirty=true; }; });
+    const vecRow = rowWrap(document.createTextNode('Vector (x,y,z):'), vecX, vecY, vecZ);
+    function refreshVectorRowVisibility(){ vecRow.style.display = ''; }
+    refreshVectorRowVisibility();
+    const btnRelease = document.createElement('button'); btnRelease.textContent='Release payload now';
+    const btnSpawn = document.createElement('button'); btnSpawn.textContent='Spawn test payload @TARS';
+    const btnClear = document.createElement('button'); btnClear.textContent='Clear payloads';
+    payloadForm.appendChild(rowWrap(modeSel, dvLbl, dvInput, btnRelease, btnSpawn, btnClear));
+    payloadForm.appendChild(vecRow);
+    // Targeting subset
+    const targetForm = document.createElement('div'); targetForm.className = 'btnbar';
+    const targetState = { mode: 'none', body: 'None', point: null };
+    const targetSel = document.createElement('select');
+    ['None','Sun','Mercury','Venus','Earth','Mars','Jupiter','Saturn','Uranus','Neptune','Point'].forEach(n=>{ const o=document.createElement('option'); o.value=n; o.textContent=n; targetSel.appendChild(o); });
+    targetSel.onchange = ()=>{ targetState.body = targetSel.value; if (targetSel.value !== 'Point') targetState.point = null; };
+    const btnSetPoint = document.createElement('button'); btnSetPoint.textContent = 'Pick point (click scene)';
+    let pickPointActive = false; btnSetPoint.onclick = ()=>{ pickPointActive = !pickPointActive; btnSetPoint.textContent = pickPointActive ? 'Picking… click scene' : 'Pick point (click scene)'; };
+    const previewToggle = document.createElement('button'); previewToggle.textContent = 'Preview: Off';
+    previewToggle.onclick = ()=>{ preview.enabled = !preview.enabled; preview.payload.line.visible = preview.enabled; preview.dirty = true; previewToggle.textContent = `Preview: ${preview.enabled ? 'On' : 'Off'}`; };
+    const horizonLabel = document.createElement('label'); horizonLabel.textContent = 'Horizon (days)';
+    const horizonInput = document.createElement('input'); horizonInput.type='number'; horizonInput.step='1'; horizonInput.min='1'; horizonInput.value = String(Math.round(preview.horizonYears * 365.25));
+    horizonInput.onchange = ()=>{ const d = Math.max(1, parseFloat(horizonInput.value)||30); preview.horizonYears = d / 365.25; preview.dirty = true; };
+    const stepsLabel = document.createElement('label'); stepsLabel.textContent = 'Steps';
+    const stepsInput = document.createElement('input'); stepsInput.type='number'; stepsInput.step='10'; stepsInput.min='10'; stepsInput.max='2000'; stepsInput.value = String(preview.steps);
+    stepsInput.onchange = ()=>{ const s = Math.min(2000, Math.max(10, parseInt(stepsInput.value)||300)); preview.steps = s; preview.dirty = true; };
+    targetForm.appendChild(rowWrap(targetSel, btnSetPoint));
+    targetForm.appendChild(rowWrap(previewToggle, horizonLabel, horizonInput, stepsLabel, stepsInput));
+    panelLaunch.appendChild(payloadForm);
+    panelLaunch.appendChild(targetForm);
+    // Aim helpers UI (for vector mode)
+    const aimForm = document.createElement('div'); aimForm.className = 'btnbar';
+    const aimRow1 = document.createElement('div'); aimRow1.className = 'row';
+    const aimRow2 = document.createElement('div'); aimRow2.className = 'row';
+    const aimLbl = document.createElement('label'); aimLbl.textContent = 'Aim sensitivity';
+    const aimSensitivity = document.createElement('input'); aimSensitivity.type='range'; aimSensitivity.min='0.0002'; aimSensitivity.max='0.02'; aimSensitivity.step='0.0002'; aimSensitivity.value='0.002';
+    const aimSensVal = document.createElement('span'); aimSensVal.className='value muted'; aimSensVal.textContent = aimSensitivity.value;
+    aimRow1.appendChild(aimLbl); aimRow1.appendChild(aimSensitivity); aimRow1.appendChild(aimSensVal);
+    aimForm.appendChild(aimRow1);
+    const azLbl = document.createElement('label'); azLbl.textContent='Azimuth (°)';
+    const elLbl = document.createElement('label'); elLbl.textContent='Elevation (°)';
+    const azInput = document.createElement('input'); azInput.type='number'; azInput.step='0.1'; azInput.min='-180'; azInput.max='180'; azInput.style.width='80px';
+    const elInput = document.createElement('input'); elInput.type='number'; elInput.step='0.1'; elInput.min='-89.9'; elInput.max='89.9'; elInput.style.width='80px';
+    const btnAzMinus = document.createElement('button'); btnAzMinus.textContent='Az -0.1°';
+    const btnAzPlus = document.createElement('button'); btnAzPlus.textContent='Az +0.1°';
+    const btnElMinus = document.createElement('button'); btnElMinus.textContent='El -0.1°';
+    const btnElPlus = document.createElement('button'); btnElPlus.textContent='El +0.1°';
+    aimRow2.appendChild(azLbl); aimRow2.appendChild(azInput); aimRow2.appendChild(btnAzMinus); aimRow2.appendChild(btnAzPlus);
+    aimRow2.appendChild(elLbl); aimRow2.appendChild(elInput); aimRow2.appendChild(btnElMinus); aimRow2.appendChild(btnElPlus);
+    // Snap buttons
+    const aimRow3 = document.createElement('div'); aimRow3.className='row';
+    const btnSnapProg = document.createElement('button'); btnSnapProg.textContent = 'Snap: Prograde';
+    const btnSnapRad = document.createElement('button'); btnSnapRad.textContent = 'Snap: Radial Out';
+    const btnSnapNorm = document.createElement('button'); btnSnapNorm.textContent = 'Snap: Normal +';
+    const btnAimPick = document.createElement('button'); btnAimPick.textContent = 'Aim: Pick on sphere';
+    aimRow3.appendChild(btnSnapProg); aimRow3.appendChild(btnSnapRad); aimRow3.appendChild(btnSnapNorm); aimRow3.appendChild(btnAimPick);
+    aimForm.appendChild(aimRow2); aimForm.appendChild(aimRow3);
+    panelLaunch.appendChild(aimForm);
+
+    // -------- Aim Ball (2D UI sphere to pick 3D direction) --------
+    const aimBallWrap = document.createElement('div'); aimBallWrap.className='btnbar';
+    const aimBallRow = document.createElement('div'); aimBallRow.className='row';
+    const aimBallCanvas = document.createElement('canvas'); aimBallCanvas.width = 300; aimBallCanvas.height = 300; aimBallCanvas.style.cursor='crosshair'; aimBallCanvas.title = 'Drag to aim (2D sphere)';
+    aimBallRow.appendChild(aimBallCanvas);
+    aimBallWrap.appendChild(aimBallRow);
+    panelLaunch.appendChild(aimBallWrap);
+
+    function updateAimBallVisibility() { aimBallWrap.style.display = ''; }
+    updateAimBallVisibility();
+    // integrate with existing modeSel handler
+    const _oldModeOnChange = modeSel.onchange;
+    drawAimBall();
+
+    function basisForAim() {
+      // Camera-oriented basis so the aim ball center aligns with camera center
+      const forward = new THREE.Vector3();
+      camera.getWorldDirection(forward);
+      const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion).normalize();
+      let right = new THREE.Vector3().crossVectors(up, forward);
+      if (right.lengthSq() < 1e-12) right = new THREE.Vector3(1, 0, 0);
+      right.normalize();
+      return { right, up, forward };
+    }
+
+    function drawAimBall() {
+      if (!aimBallCanvas || aimBallWrap.style.display === 'none') return;
+      const ctx = aimBallCanvas.getContext('2d');
+      const W = aimBallCanvas.width, H = aimBallCanvas.height; const cx = W/2, cy = H/2, R = Math.min(W,H)*0.48;
+      ctx.clearRect(0,0,W,H);
+      // Outer circle
+      ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI*2); ctx.strokeStyle = '#6b7280'; ctx.lineWidth = 1; ctx.stroke();
+      // Light shading
+      const grd = ctx.createRadialGradient(cx-0.3*R, cy-0.3*R, 0, cx, cy, R);
+      grd.addColorStop(0, '#334155'); grd.addColorStop(1, '#0f172a');
+      ctx.fillStyle = grd; ctx.beginPath(); ctx.arc(cx, cy, R-1, 0, Math.PI*2); ctx.fill();
+      // Current vector projected
+      const dir = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ);
+      if (dir.lengthSq() < 1e-12) dir.set(1,0,0); dir.normalize();
+      const { right, up, forward } = basisForAim();
+      const u = -dir.dot(right), v = dir.dot(up), w = dir.dot(forward);
+      const r2 = u*u + v*v;
+      const inside = r2 <= 1 + 1e-6;
+      const px = cx + (u * R);
+      const py = cy - (v * R);
+      // Crosshair
+      ctx.strokeStyle = '#94a3b8'; ctx.globalAlpha = 0.5; ctx.beginPath(); ctx.moveTo(cx-R, cy); ctx.lineTo(cx+R, cy); ctx.moveTo(cx, cy-R); ctx.lineTo(cx, cy+R); ctx.stroke(); ctx.globalAlpha=1;
+      // Dot
+      ctx.beginPath(); ctx.arc(px, py, 4, 0, Math.PI*2);
+      ctx.fillStyle = (w >= 0) ? '#22c55e' : '#ef4444';
+      ctx.fill(); ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.stroke();
+    }
+
+    function setVectorFromBallPoint(u, v, allowBack) {
+      const r2 = u*u + v*v;
+      let w = 0;
+      if (r2 <= 1) {
+        w = Math.sqrt(Math.max(0, 1 - r2));
+      } else {
+        const s = 1/Math.sqrt(r2); u *= s; v *= s; // clamp onto circle
+      }
+      if (allowBack) {
+        // Determine hemisphere by current vector sign along forward
+        const { forward } = basisForAim();
+        const curr = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ).normalize();
+        const sign = Math.sign(curr.dot(forward)) || 1;
+        w *= sign;
+      }
+      const { right, up, forward } = basisForAim();
+      const worldDir = new THREE.Vector3().addScaledVector(right, -u).addScaledVector(up, v).addScaledVector(forward, w).normalize();
+      setVectorFromDir(worldDir);
+      drawAimBall(); updateAzElInputs();
+    }
+
+    (function initAimBallEvents(){
+      let dragging = false;
+      aimBallCanvas.addEventListener('pointerdown', (e)=>{
+        dragging = true; aimBallCanvas.setPointerCapture?.(e.pointerId);
+        const rect = aimBallCanvas.getBoundingClientRect();
+        const x = (e.clientX - rect.left); const y = (e.clientY - rect.top);
+        const cx = rect.width/2, cy = rect.height/2, R = Math.min(rect.width, rect.height)*0.48;
+        const u = (x - cx)/R, v = -(y - cy)/R;
+        setVectorFromBallPoint(u, v, false);
+      });
+      aimBallCanvas.addEventListener('pointermove', (e)=>{
+        if (!dragging) return;
+        const rect = aimBallCanvas.getBoundingClientRect();
+        const x = (e.clientX - rect.left); const y = (e.clientY - rect.top);
+        const cx = rect.width/2, cy = rect.height/2, R = Math.min(rect.width, rect.height)*0.48;
+        const u = (x - cx)/R, v = -(y - cy)/R;
+        setVectorFromBallPoint(u, v, false);
+      });
+      aimBallCanvas.addEventListener('pointerup', (e)=>{ dragging = false; aimBallCanvas.releasePointerCapture?.(e.pointerId); });
+      aimBallCanvas.addEventListener('pointerleave', ()=>{ dragging = false; });
+    })();
+
+    // 3D vector sight for payload aiming (visible in 'vector' mode)
+    const sight = new THREE.Group();
+    const axisLen = 10_000; // km in render units
+    const coneGeom = new THREE.ConeGeometry(axisLen * 0.1, axisLen * 0.5, 24);
+    const coneMat = new THREE.MeshBasicMaterial({ color: 0x44ff77, transparent: true, opacity: 0.35, depthTest: false });
+    const cone = new THREE.Mesh(coneGeom, coneMat);
+    cone.position.z = -axisLen * 0.25; // so the tip is at sight origin
+    cone.rotation.x = Math.PI / 2;
+    const axis = new THREE.AxesHelper(axisLen * 0.2);
+    axis.renderOrder = 9999; cone.renderOrder = 9999;
+    sight.add(cone); sight.add(axis);
+    sight.visible = false;
+    scene.add(sight);
+
+    function updateSightVisibility() {
+      sight.visible = state.focus === 'TARS';
+    }
+    updateSightVisibility();
+    // vector-only mode; keep sight visibility updated by focus
+
+    // -------- Movable sight gizmo (Shift+Drag to aim) --------
+    const sightDrag = { active: false, lastX: 0, lastY: 0 };
+    let aimSense = 0.005;
+    aimSensitivity.oninput = ()=>{ aimSense = parseFloat(aimSensitivity.value)||0.005; aimSensVal.textContent = aimSensitivity.value; };
+    function setVectorFromDir(dir) {
+      const d = dir.clone(); if (d.lengthSq() < 1e-12) d.set(1,0,0); d.normalize();
+      payloadState.vecX = d.x; payloadState.vecY = d.y; payloadState.vecZ = d.z; preview.dirty = true;
+      // reflect in inputs
+      try { vecX.value = String(payloadState.vecX.toFixed(3)); vecY.value = String(payloadState.vecY.toFixed(3)); vecZ.value = String(payloadState.vecZ.toFixed(3)); } catch {}
+    }
+    function onPointerDownAim(e) {
+      if (!(payloadState.dvMode === 'vector' && state.focus === 'TARS')) return;
+      if (!e.shiftKey) return;
+      sightDrag.active = true; sightDrag.lastX = e.clientX; sightDrag.lastY = e.clientY;
+      try { renderer.domElement.setPointerCapture(e.pointerId); } catch {}
+      controls.enabled = false;
+      e.preventDefault();
+    }
+    function onPointerMoveAim(e) {
+      if (!sightDrag.active) return;
+      const dx = e.clientX - sightDrag.lastX;
+      const dy = e.clientY - sightDrag.lastY;
+      sightDrag.lastX = e.clientX; sightDrag.lastY = e.clientY;
+      // Rotate current vector by camera-space right/up axes
+      const curr = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ);
+      if (curr.lengthSq() < 1e-12) curr.set(1,0,0);
+      curr.normalize();
+      const camForward = new THREE.Vector3(); camera.getWorldDirection(camForward);
+      const camUp = new THREE.Vector3(0,1,0).applyQuaternion(camera.quaternion).normalize();
+      const camRight = new THREE.Vector3().crossVectors(camUp, camForward).normalize();
+      curr.applyAxisAngle(camUp, -dx * aimSense);
+      curr.applyAxisAngle(camRight, -dy * aimSense);
+      setVectorFromDir(curr);
+      e.preventDefault();
+    }
+    function onPointerUpAim(e) {
+      if (!sightDrag.active) return;
+      sightDrag.active = false;
+      try { renderer.domElement.releasePointerCapture(e.pointerId); } catch {}
+      controls.enabled = true;
+      e.preventDefault();
+    }
+    renderer.domElement.addEventListener('pointerdown', onPointerDownAim);
+    renderer.domElement.addEventListener('pointermove', onPointerMoveAim);
+    renderer.domElement.addEventListener('pointerup', onPointerUpAim);
+    renderer.domElement.addEventListener('pointerleave', onPointerUpAim);
+
+    // Azimuth/elevation helpers operate in TARS-local frame (up = +Y, forward = radial tangent)
+    function getAimDir() { return new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ).normalize(); }
+    function setAimFromAzEl(azDeg, elDeg) {
+      const az = azDeg * Math.PI/180, el = elDeg * Math.PI/180;
+      // Start from forward in xz-plane (use TARS-prograde basis)
+      const { prograde, radial } = getOrthoBasis();
+      const up = new THREE.Vector3(0,1,0);
+      const right = new THREE.Vector3().crossVectors(up, prograde).normalize();
+      // Build orientation: rotate around up by az, then around right by el
+      const dir = prograde.clone().applyAxisAngle(up, az).applyAxisAngle(right, el).normalize();
+      setVectorFromDir(dir);
+    }
+    function updateAzElInputs() {
+      const dir = getAimDir();
+      const { prograde } = getOrthoBasis();
+      const up = new THREE.Vector3(0,1,0);
+      const right = new THREE.Vector3().crossVectors(up, prograde).normalize();
+      const forward = prograde;
+      // Compute azimuth/elevation from local basis
+      const x = dir.dot(right), y = dir.dot(up), z = dir.dot(forward);
+      const el = Math.asin(Math.max(-1, Math.min(1, y)));
+      const az = Math.atan2(x, z);
+      azInput.value = String((az*180/Math.PI).toFixed(0));
+      elInput.value = String((el*180/Math.PI).toFixed(0));
+    }
+    azInput.onchange = ()=> setAimFromAzEl(parseFloat(azInput.value)||0, parseFloat(elInput.value)||0);
+    elInput.onchange = ()=> setAimFromAzEl(parseFloat(azInput.value)||0, parseFloat(elInput.value)||0);
+    btnAzMinus.onclick = ()=> setAimFromAzEl((parseFloat(azInput.value)||0) - 1, parseFloat(elInput.value)||0);
+    btnAzPlus.onclick = ()=> setAimFromAzEl((parseFloat(azInput.value)||0) + 1, parseFloat(elInput.value)||0);
+    btnElMinus.onclick = ()=> setAimFromAzEl(parseFloat(azInput.value)||0, (parseFloat(elInput.value)||0) - 1);
+    btnElPlus.onclick = ()=> setAimFromAzEl(parseFloat(azInput.value)||0, (parseFloat(elInput.value)||0) + 1);
+    btnSnapProg.onclick = ()=>{ const { prograde } = getOrthoBasis(); setVectorFromDir(prograde); updateAzElInputs(); };
+    btnSnapRad.onclick = ()=>{ const { radial } = getOrthoBasis(); setVectorFromDir(radial); updateAzElInputs(); };
+    btnSnapNorm.onclick = ()=>{ const { normal } = getOrthoBasis(); setVectorFromDir(normal); updateAzElInputs(); };
+    // Initialize az/el
+    updateAzElInputs();
+
+    function mpsToAUPerYr(mps) { return mps * (1/149597870700) * (365.25*24*3600); }
+    function computeSpinDvAUPerYr() {
+      // tip speed [m/s] = spin [rad/s] * (tipScaleMSPerRad)
+      const dv_mps = Math.max(0, tars.spin) * payloadState.tipScaleMSPerRad;
+      return mpsToAUPerYr(dv_mps);
+    }
+    function getTipTangentDir() {
+      const { prograde } = getOrthoBasis();
+      const up = new THREE.Vector3(0, 1, 0);
+      const right = new THREE.Vector3().crossVectors(up, prograde).normalize();
+      // Tangent aligned with spin phase by rotating prograde around up
+      return prograde.clone().applyAxisAngle(up, tars.spinPhase).normalize();
+    }
+
+    function releasePayloadNow() {
+      // Ejection direction and magnitude determine payload exit velocity relative to TARS.
+      let dvAUPerYr = mpsToAUPerYr(payloadState.dvMag);
+      let dir = new THREE.Vector3(-payloadState.vecX, payloadState.vecY, payloadState.vecZ);
+      if (dir.lengthSq() < 1e-12) dir.set(1,0,0);
+      dir.normalize();
+      // Track the single Δv quantity: payload exit speed in m/s
+      tars.lastExitVelocityMps = dvAUPerYr * (149597870700) / (365.25*24*3600);
+      const init = {
+        position: tars.position.clone(),
+        velocity: new THREE.Vector3().copy(dir).multiplyScalar(dvAUPerYr),
+        color: 0x66ff88
+      };
+      spawnPayload(init);
+    }
+    btnRelease.onclick = releasePayloadNow;
+    btnSpawn.onclick = ()=>{
+      spawnPayload({ position: tars.position.clone(), velocity: tars.velocity.clone(), color: 0x99ffcc });
+    };
+    btnClear.onclick = ()=>{
+      [...simObjects.payloads.map(p=>p.id)].forEach(despawnById);
+    };
+
+    // ---------- Legacy targeting block removed (merged into Launch panel) ----------
+
+    function setActiveTab(which) {
+      const map = {
+        controls: [tabControls, panelControls],
+        physics: [tabPhysics, panelPhysics],
+        graphics: [tabGraphics, panelGraphics],
+        launch: [tabLaunch, panelLaunch]
+      };
+      for (const k of Object.keys(map)) {
+        const [btn, panel] = map[k];
+        btn.classList.toggle('active', k === which);
+        panel.classList.toggle('active', k === which);
+      }
+    }
+    tabControls.onclick = () => setActiveTab('controls');
+    tabPhysics.onclick = () => setActiveTab('physics');
+    tabLaunch.onclick = () => setActiveTab('launch');
+    tabGraphics.onclick = () => setActiveTab('graphics');
+
+    function setMultiplier(x) {
+      const clamped = Math.max(1, Math.min(1_000_000_000, Math.round(x)));
+      state.timeScaleMultiplier = clamped;
+      state.timeScaleYearsPerSec = clamped * REALTIME_YEARS_PER_SEC;
+      speedInput.value = String(Math.log10(clamped)); // Store log value for slider
+      speedNumber.value = String(clamped); // Store actual value for number input
+      speedValue.textContent = `${clamped.toLocaleString()}x (${state.timeScaleYearsPerSec.toExponential(3)} y/s)`;
+    }
+    setMultiplier(state.timeScaleMultiplier);
+
+    btnStart.onclick = () => { state.paused = false; };
+    btnPause.onclick = () => { state.paused = true; };
+    btnStop.onclick = () => { state.paused = true; setMultiplier(1); };
+    btnFollow.onclick = () => {
+      state.followTARS = !state.followTARS;
+      const focusObj = nameToBody[state.focus];
+      if (state.followTARS && focusObj) {
+        state.followOffset = camera.position.clone().sub(focusObj.position);
+        state.prevFollowTarget = focusObj.position.clone();
+      }
+    };
+    btnFaster.onclick = () => { setMultiplier(state.timeScaleMultiplier * 1.6); };
+    btnSlower.onclick = () => { setMultiplier(state.timeScaleMultiplier / 1.6); };
+    btnSpin.onclick = () => {
+      // Boost spin directly (no reserves)
+      tars.spin += physics.spinGainK * 0.5 * REALTIME_YEARS_PER_SEC; // small bump
+    };
+    btnOrbits.onclick = () => {
+      state.showOrbits = !state.showOrbits;
+      for (const l of orbitGuides) l.visible = state.showOrbits;
+    };
+    btnStars.onclick = () => { state.showStarfield = !state.showStarfield; starfield.visible = state.showStarfield; };
+    btnLabels.onclick = () => {
+      state.showLabels = !state.showLabels;
+      for (const p of planets) if (p.label) p.label.visible = state.showLabels;
+      if (tarsLabel) tarsLabel.visible = state.showLabels;
+      for (const pl of simObjects.payloads) if (pl.label) pl.label.visible = state.showLabels;
+      for (const m of simObjects.markers) if (m.label) m.label.visible = state.showLabels;
+    };
+    btnTrails.onclick = () => {
+      state.showTrails = !state.showTrails;
+      tarsTrail.line.visible = state.showTrails;
+      for (const pl of simObjects.payloads) if (pl.trail && pl.trail.line) pl.trail.line.visible = state.showTrails;
+    };
+    btnResetView.onclick = () => frameFocus(true);
+    speedInput.oninput = () => { setMultiplier(Math.pow(10, parseFloat(speedInput.value))); }; // Convert back to linear
+    speedNumber.onchange = () => { setMultiplier(parseFloat(speedNumber.value) || 1); };
+    focusSelect.onchange = () => {
+      state.focus = focusSelect.value;
+      frameFocus(true);
+      const focusObj = nameToBody[state.focus];
+      if (state.followTARS && focusObj) {
+        state.followOffset = camera.position.clone().sub(focusObj.position);
+        state.prevFollowTarget = focusObj.position.clone();
+      }
+    };
+    
+    const DV = 0.001; // AU/year per click
+    // Keyboard shortcuts
+    // Space: play/pause, +/-: faster/slower, o/s/l/t: toggles, f: follow, r: reset view, p: boost spin
+    // Arrows: apply small thrusts (Up=prograde, Down=retrograde, Left=radial in, Right=radial out)
+    window.addEventListener('keydown', (e) => {
+      // Avoid interfering with typing in inputs
+      const tag = (document.activeElement && document.activeElement.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      const key = e.key;
+      if (key === ' ') { e.preventDefault(); state.paused = !state.paused; return; }
+      if (key === '+' || key === '=' || key === ']') { setMultiplier(state.timeScaleMultiplier * 1.6); return; }
+      if (key === '-' || key === '_' || key === '[') { setMultiplier(state.timeScaleMultiplier / 1.6); return; }
+      if (key === 'o' || key === 'O') { btnOrbits.click(); return; }
+      if (key === 's' || key === 'S') { btnStars.click(); return; }
+      if (key === 'l' || key === 'L') { btnLabels.click(); return; }
+      if (key === 't' || key === 'T') { btnTrails.click(); return; }
+      if (key === 'f' || key === 'F') { btnFollow.click(); return; }
+      if (key === 'r' || key === 'R') { btnResetView.click(); return; }
+      if (key === 'p' || key === 'P') { btnSpin.click(); return; }
+      const DV_KEY = DV;
+      if (key === 'ArrowUp') { e.preventDefault(); const { prograde } = getOrthoBasis(); tryApplyDv(prograde, DV_KEY); return; }
+      if (key === 'ArrowDown') { e.preventDefault(); const { prograde } = getOrthoBasis(); tryApplyDv(prograde.multiplyScalar(-1), DV_KEY); return; }
+      if (key === 'ArrowLeft') { e.preventDefault(); const { radial } = getOrthoBasis(); tryApplyDv(radial.multiplyScalar(-1), DV_KEY); return; }
+      if (key === 'ArrowRight') { e.preventDefault(); const { radial } = getOrthoBasis(); tryApplyDv(radial, DV_KEY); return; }
+    });
+
+    function frameFocus(instant = false) {
+      const obj = nameToBody[state.focus];
+      if (!obj) return;
+      const target = obj.position.clone();
+      const lerpAlpha = instant ? 1.0 : 0.5;
+      controls.target.lerp(target, lerpAlpha);
+      // Set camera distance heuristically per body
+      const distAU = (state.focus === 'Sun') ? 10 : (state.focus === 'TARS') ? 0.1 : 2.0;
+      const toCam = new THREE.Vector3(0, SCALE * distAU * 0.6, SCALE * distAU);
+      if (instant) {
+        camera.position.copy(target.clone().add(toCam));
+        camera.lookAt(target);
+        state.followOffset = camera.position.clone().sub(target);
+      }
+    }
+
+    // Initial camera framing and resize handling
+    controls.target.set(0, 0, 0);
+    camera.lookAt(controls.target);
+    frameFocus(true);
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // Labels via CanvasTexture sprites
+    const allLabels = [];
+    function createLabelSprite(text) {
+      const cnv = document.createElement('canvas');
+      const ctx = cnv.getContext('2d');
+      const pad = 8; const fs = 28; const font = `${fs}px sans-serif`;
+      ctx.font = font;
+      const w = Math.ceil(ctx.measureText(text).width) + pad * 2;
+      const h = fs + pad * 2;
+      cnv.width = w; cnv.height = h;
+      ctx.font = font; ctx.textBaseline = 'top';
+      ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(0, 0, w, h);
+      ctx.strokeStyle = 'rgba(255,255,255,0.3)'; ctx.strokeRect(0, 0, w, h);
+      ctx.fillStyle = 'white'; ctx.fillText(text, pad, pad);
+      const tex = new THREE.CanvasTexture(cnv);
+      tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+      const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, depthWrite: false, transparent: true });
+      const sprite = new THREE.Sprite(mat);
+      sprite.userData.name = text;
+      sprite.renderOrder = 9999;
+      sprite.renderOrder = 9999;
+      allLabels.push(sprite);
+      return sprite;
+    }
+    for (const p of planets) {
+      const label = createLabelSprite(p.name);
+      label.position.set(0, Math.max(1.8, p.radiusRender + 1.0), 0);
+      label.visible = state.showLabels;
+      p.mesh.add(label);
+      p.label = label;
+    }
+    
+    // Label for TARS
+    const tarsLabel = createLabelSprite('TARS');
+    tarsLabel.position.set(0, 2.0, 0);
+    tarsLabel.visible = state.showLabels;
+    tars.mesh.add(tarsLabel);
+
+    // ---------- Animation loop ----------
+    // Basic on-screen error reporting to help diagnose blank page issues
+    window.addEventListener('error', (e) => {
+      const div = document.createElement('div');
+      div.style.position = 'fixed'; div.style.left = '12px'; div.style.bottom = '12px'; div.style.zIndex = '9999';
+      div.style.maxWidth = '50vw'; div.style.background = 'rgba(80,0,0,0.8)'; div.style.padding = '8px 10px'; div.style.border = '1px solid #a44'; div.style.borderRadius = '6px';
+      div.style.fontSize = '12px'; div.style.whiteSpace = 'pre-wrap'; div.textContent = `Error: ${e.message}`;
+      document.body.appendChild(div);
+      console.error(e.error || e.message);
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      const div = document.createElement('div');
+      div.style.position = 'fixed'; div.style.left = '12px'; div.style.bottom = '12px'; div.style.zIndex = '9999';
+      div.style.maxWidth = '50vw'; div.style.background = 'rgba(80,0,0,0.8)'; div.style.padding = '8px 10px'; div.style.border = '1px solid #a44'; div.style.borderRadius = '6px';
+      div.style.fontSize = '12px'; div.style.whiteSpace = 'pre-wrap'; div.textContent = `Unhandled rejection: ${e.reason}`;
+      document.body.appendChild(div);
+      console.error(e.reason);
+    });
+
+    let lastMs = performance.now();
+    let prevCamQuat = camera.quaternion.clone();
+    let reanchoredThisFrame = false;
+    // Smoothed visual transform for TARS (render-only)
+    const tarsVisual = { position: new THREE.Vector3() };
+    function animate() {
+      requestAnimationFrame(animate);
+      const now = performance.now();
+      const realDtSeconds = Math.max(0, (now - lastMs) / 1000);
+      lastMs = now;
+
+      // Convert to sim years and clamp step for stability with substeps
+      let dtYears = (state.paused ? 0 : realDtSeconds * state.timeScaleYearsPerSec);
+      const frameSimYears = dtYears;
+      let remaining = dtYears;
+      while (remaining > 0) {
+        const step = Math.min(remaining, physics.maxDt);
+        // Integrate all planets (Sun-planet gravity only)
+        for (const p of planets) integrateSunGravityVerletBody(p, step);
+        // TARS update
+        updateTars(step);
+        // Payload updates
+        updatePayloads(step);
+        state.simYears += step;
+        remaining -= step;
+      }
+
+      // Visuals
+      // Adjust render origin based on TARS world position (decoupled from camera)
+      {
+        const tarsWorldKm = new THREE.Vector3(
+          tars.position.x * SCALE,
+          tars.position.y * SCALE,
+          tars.position.z * SCALE
+        );
+        const delta = tarsWorldKm.clone().sub(renderOrigin);
+        if (delta.length() > RENDER_REANCHOR_KM) {
+          renderOrigin.add(delta);
+          // Preserve current view: move camera and controls target by -delta
+          camera.position.sub(delta);
+          controls.target.sub(delta);
+          // Keep trails continuous by shifting their anchors by -delta (local space)
+          tarsTrail.anchor.sub(delta);
+          for (const pl of simObjects.payloads) if (pl.trail) pl.trail.anchor.sub(delta);
+          reanchoredThisFrame = true;
+        }
+      }
+      for (const p of planets) p.updateVisual();
+      // Align static visuals to render origin
+      starfield.position.set(-renderOrigin.x, -renderOrigin.y, -renderOrigin.z);
+      for (const g of orbitGuides) g.position.set(-renderOrigin.x, -renderOrigin.y, -renderOrigin.z);
+      // Sun position is derived from its true world position each frame relative to render origin
+      sun.position.set(
+        0 - renderOrigin.x,
+        0 - renderOrigin.y,
+        0 - renderOrigin.z
+      );
+
+      // Exponential smoothing for TARS visual position (reduces jitter at low dt)
+      const physicsLocal = new THREE.Vector3(
+        tars.position.x * SCALE - renderOrigin.x,
+        tars.position.y * SCALE - renderOrigin.y,
+        tars.position.z * SCALE - renderOrigin.z
+      );
+      const smoothingTime = 0.0; // 0 = no positional smoothing
+      if (smoothingTime <= 0) {
+        tars.mesh.position.copy(physicsLocal);
+      } else {
+        const alpha = 1 - Math.exp(-realDtSeconds / Math.max(1e-6, smoothingTime));
+        if (!Number.isFinite(tarsVisual.position.x)) tarsVisual.position.copy(physicsLocal);
+        tarsVisual.position.lerp(physicsLocal, alpha);
+        // Render TARS at smoothed position, but do not alter physics state
+        tars.mesh.position.copy(tarsVisual.position);
+      }
+      if (state.showTrails) {
+        // Trails follow unsmoothed physics to avoid smoothing error accumulation
+        appendToTrail(tarsTrail, physicsLocal);
+        if (tarsTrail.headPositions && tarsTrail.count > 0) {
+          const hp = tarsTrail.headPositions;
+          const lastIdx = (tarsTrail.count - 1) * 3;
+          hp[0] = tarsTrail.positions[lastIdx+0];
+          hp[1] = tarsTrail.positions[lastIdx+1];
+          hp[2] = tarsTrail.positions[lastIdx+2];
+          hp[3] = physicsLocal.x - tarsTrail.anchor.x;
+          hp[4] = physicsLocal.y - tarsTrail.anchor.y;
+          hp[5] = physicsLocal.z - tarsTrail.anchor.z;
+          tarsTrail.headGeometry.attributes.position.needsUpdate = true;
+          tarsTrail.headGeometry.setDrawRange(0, 2);
+        }
+      }
+
+      for (const pl of simObjects.payloads) {
+        const plLocal = new THREE.Vector3(
+          pl.position.x * SCALE - renderOrigin.x,
+          pl.position.y * SCALE - renderOrigin.y,
+          pl.position.z * SCALE - renderOrigin.z
+        );
+        pl.mesh.position.copy(plLocal);
+        if (state.showTrails) {
+          appendToTrail(pl.trail, plLocal);
+          if (pl.trail.headPositions && pl.trail.count > 0) {
+            const hp = pl.trail.headPositions;
+            const lastIdx = (pl.trail.count - 1) * 3;
+            hp[0] = pl.trail.positions[lastIdx+0];
+            hp[1] = pl.trail.positions[lastIdx+1];
+            hp[2] = pl.trail.positions[lastIdx+2];
+            hp[3] = plLocal.x - pl.trail.anchor.x;
+            hp[4] = plLocal.y - pl.trail.anchor.y;
+            hp[5] = plLocal.z - pl.trail.anchor.z;
+            pl.trail.headGeometry.attributes.position.needsUpdate = true;
+            pl.trail.headGeometry.setDrawRange(0, 2);
+          }
+        }
+      }
+      sun.rotation.y += 0.02; // slow spin for visual interest
+
+      // Optional camera follow with zoom/orbit preserved
+      const focusObj = nameToBody[state.focus];
+      if (state.followTARS && focusObj) {
+        if (!state.prevFollowTarget) {
+          state.prevFollowTarget = focusObj.position.clone();
+        }
+        const delta = new THREE.Vector3().copy(focusObj.position).sub(state.prevFollowTarget);
+        controls.target.add(delta);
+        camera.position.add(delta);
+        state.prevFollowTarget.copy(focusObj.position);
+      }
+      reanchoredThisFrame = false;
+
+      // Apply orientation and spin once per frame
+      {
+        // Vertical orientation: root points up, model faces Sun horizontally
+        const up = new THREE.Vector3(0, 1, 0);
+        const radialDir = tars.position.clone().normalize();
+        const forward = new THREE.Vector3(radialDir.x, 0, radialDir.z);
+        if (forward.lengthSq() < 1e-8) forward.set(1, 0, 0);
+        forward.normalize();
+        const right = new THREE.Vector3().crossVectors(up, forward).normalize();
+        const m = new THREE.Matrix4();
+        m.makeBasis(right, up, forward);
+        const baseQuat = new THREE.Quaternion().setFromRotationMatrix(m);
+        tars.mesh.setRotationFromQuaternion(baseQuat);
+        // Update sight transform to match TARS position and vector mode direction
+        if (sight && sight.visible) {
+          sight.position.copy(tars.mesh.position);
+          // Aim according to vector (payloadState.vecX,Y,Z) in world frame
+          const aim = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ);
+          if (aim.lengthSq() < 1e-12) aim.set(1, 0, 0);
+          aim.normalize();
+          // Convert world direction to local render coords (same here since we apply at mesh position)
+          const quat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), aim);
+          sight.setRotationFromQuaternion(quat);
+        }
+        // Spin geometry around spinNode's local Y so the disc remains vertical (tie to simulation time)
+        tars.spinPhase = (tars.spinPhase + tars.spin * frameSimYears * YEAR_SECONDS) % (Math.PI * 2);
+        const sn = tars.mesh.userData.spinNode;
+        if (sn) { sn.rotation.y = tars.spinPhase; }
+      }
+
+      controls.update();
+
+      for (const label of allLabels) {
+        const distance = camera.position.distanceTo(label.getWorldPosition(new THREE.Vector3()));
+        const scale = distance * 0.05;
+        label.scale.set(scale, scale, 1);
+      }
+      // If following, keep offset implicit; no overwrite to preserve user zoom/orbit
+      // Redraw aim ball when camera rotates so the aimpoint remains consistent relative to screen center
+      if (!camera.quaternion.equals(prevCamQuat)) {
+        prevCamQuat.copy(camera.quaternion);
+        drawAimBall();
+      }
+      // Lazy-update preview
+      if (preview.enabled) {
+        // Recompute only when marked dirty or every ~0.2s of real time
+        if (preview._accum == null) preview._accum = 0;
+        preview._accum += realDtSeconds;
+        if (preview.dirty || preview._accum > 0.2) {
+          computePayloadPreview();
+          preview._accum = 0;
+        }
+      }
+      updateHUD();
+      renderer.render(scene, camera);
+    }
+    animate();
+    
+    // Thrust/DV helpers and bindings
+    function tryApplyDv(dirVec, magnitudeAUPerYr) {
+      const dvMps = magnitudeAUPerYr * (149597870700) / (365.25*24*3600);
+      tars.lastExitVelocityMps = dvMps;
+      tars.velocity.addScaledVector(dirVec, magnitudeAUPerYr);
+    }
+    function getOrthoBasis() {
+      const epsilon = 1e-12;
+      const rWorld = tars.position.clone();
+      const vWorld = tars.velocity.clone();
+      const rLen = rWorld.length();
+      const vLen = vWorld.length();
+      const radial = rLen > epsilon ? rWorld.multiplyScalar(1 / rLen) : new THREE.Vector3(1, 0, 0);
+      const prograde = vLen > epsilon ? vWorld.multiplyScalar(1 / vLen) : new THREE.Vector3(-radial.z, 0, radial.x).normalize();
+      let normal = new THREE.Vector3().crossVectors(rWorld, vWorld);
+      if (normal.lengthSq() < epsilon * epsilon) {
+        const up = new THREE.Vector3(0, 1, 0);
+        normal = new THREE.Vector3().crossVectors(radial, up);
+        if (normal.lengthSq() < epsilon * epsilon) {
+          normal = new THREE.Vector3().crossVectors(radial, new THREE.Vector3(1, 0, 0));
+        }
+      }
+      normal.normalize();
+      return { prograde, normal, radial };
+    }
+    btnProg.onclick = () => { const { prograde } = getOrthoBasis(); tryApplyDv(prograde, DV); };
+    btnRetro.onclick = () => { const { prograde } = getOrthoBasis(); tryApplyDv(prograde.multiplyScalar(-1), DV); };
+    btnRadOut.onclick = () => { const { radial } = getOrthoBasis(); tryApplyDv(radial, DV); };
+    btnRadIn.onclick = () => { const { radial } = getOrthoBasis(); tryApplyDv(radial.multiplyScalar(-1), DV); };
+    btnNormUp.onclick = () => { const { normal } = getOrthoBasis(); tryApplyDv(normal, DV); };
+    btnNormDn.onclick = () => { const { normal } = getOrthoBasis(); tryApplyDv(normal.multiplyScalar(-1), DV); };
+    btnResetTars.onclick = () => {
+      tars.position.set(1.0, 0, 0.01);
+      const r = Math.sqrt(tars.position.lengthSq());
+      const v = Math.sqrt(physics.muSun / r);
+      const dir = new THREE.Vector3(-tars.position.z, 0, tars.position.x).normalize();
+      tars.velocity.copy(dir.multiplyScalar(v));
+      tars.spin = 0;
+      tars.lastExitVelocityMps = 0;
+      // clear trail
+      tarsTrail.count = 0; tarsTrail.geometry.setDrawRange(0, 0); tarsTrail._lastPos = null; tarsTrail._lastSimYears = null;
+      // clear payloads and markers
+      const payloadIds = simObjects.payloads.map(p => p.id);
+      payloadIds.forEach(despawnById);
+      const markerIds = simObjects.markers.map(m => m.id);
+      markerIds.forEach(despawnById);
+      // disable and clear preview
+      if (preview && preview.payload && preview.payload.line) {
+        preview.enabled = false;
+        preview.payload.line.visible = false;
+        preview.dirty = true;
+      }
+    };
+  </script>
+</body>
+</html>
+
+
