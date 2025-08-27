@@ -978,6 +978,7 @@
     // Aim helpers UI (for vector mode)
     const aimForm = document.createElement('div'); aimForm.className = 'btnbar';
     
+    const aimRow2 = document.createElement('div'); aimRow2.className = 'row';
     const azLbl = document.createElement('label'); azLbl.textContent='Azimuth (°)';
     const elLbl = document.createElement('label'); elLbl.textContent='Elevation (°)';
     const azInput = document.createElement('input'); azInput.type='number'; azInput.step='0.1'; azInput.min='-180'; azInput.max='180'; azInput.style.width='80px';
@@ -1038,7 +1039,7 @@
       const dir = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ);
       if (dir.lengthSq() < 1e-12) dir.set(1,0,0); dir.normalize();
       const { right, up, forward } = basisForAim();
-      const u = -dir.dot(right), v = dir.dot(up), w = dir.dot(forward);
+      const u = dir.dot(right), v = dir.dot(up), w = dir.dot(forward);
       const r2 = u*u + v*v;
       const inside = r2 <= 1 + 1e-6;
       const px = cx + (u * R);
@@ -1067,7 +1068,7 @@
         w *= sign;
       }
       const { right, up, forward } = basisForAim();
-      const worldDir = new THREE.Vector3().addScaledVector(right, -u).addScaledVector(up, v).addScaledVector(forward, w).normalize();
+      const worldDir = new THREE.Vector3().addScaledVector(right, u).addScaledVector(up, v).addScaledVector(forward, w).normalize();
       setVectorFromDir(worldDir);
       drawAimBall(); updateAzElInputs();
     }
@@ -1125,7 +1126,7 @@
       const camForward = new THREE.Vector3(); camera.getWorldDirection(camForward);
       const camUp = new THREE.Vector3(0,1,0).applyQuaternion(camera.quaternion).normalize();
       const camRight = new THREE.Vector3().crossVectors(camUp, camForward).normalize();
-      curr.applyAxisAngle(camUp, dx * aimSense);
+      curr.applyAxisAngle(camUp, -dx * aimSense);
       curr.applyAxisAngle(camRight, -dy * aimSense);
       setVectorFromDir(curr);
       e.preventDefault();
