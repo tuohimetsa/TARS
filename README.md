@@ -1,4 +1,4 @@
-# TARS Solar System
+["TARS"](https://tuohimetsa.github.io/TARS/tars_solar_system.html)
 
 A visualization of the TARS (Torqued Accelerator using Radiation from the Sun) concept.
 
