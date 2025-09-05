@@ -180,6 +180,20 @@
     // Sun
     const sun = createSun();
 
+    const hitMarker = new THREE.Mesh(
+      new THREE.SphereGeometry(20000, 16, 16), // 10000 km radius
+      new THREE.MeshBasicMaterial({ color: 0xff0000, transparent: true, opacity: 0.8 })
+    );
+    hitMarker.visible = false;
+    scene.add(hitMarker);
+
+    const closestApproachMarker = new THREE.Mesh(
+      new THREE.SphereGeometry(8000, 16, 16), // 8000 km radius
+      new THREE.MeshBasicMaterial({ color: 0xffff00, transparent: true, opacity: 0.7 })
+    );
+    closestApproachMarker.visible = false;
+    scene.add(closestApproachMarker);
+
     // Orbit guide helper (circles)
     const orbitGuides = [];
     const gravityWells = []; // New array for gravity wells
@@ -214,9 +228,20 @@
       const material = new THREE.LineBasicMaterial({ color, transparent: true, opacity });
       const line = new THREE.LineLoop(geometry, material);
       gravityWells.push(line); // Add to the array
-      scene.add(line);
       return line;
     }
+
+    // Approx planet mass ratios (Mplanet / MSun)
+    const planetMassRatio = {
+      Mercury: 1.651e-7,
+      Venus:   2.447e-6,
+      Earth:   3.003e-6,
+      Mars:    3.227e-7,
+      Jupiter: 9.5479e-4,
+      Saturn:  2.858e-4,
+      Uranus:  4.366e-5,
+      Neptune: 5.151e-5
+    };
 
     // Planets with approximate semi-major axes (AU) and render radii (exaggerated)
     const planets = [
@@ -237,6 +262,7 @@
       // Calculate and add gravity well
       const massRatio = planetMassRatio[p.name] || 0;
       const hillRadiusAU = p.a * Math.pow(massRatio / 3, 1/3);
+      body.hillRadiusAU = hillRadiusAU; // Storing for preview intersection
       const well = addGravityWell(hillRadiusAU, p.color, 0.15);
       body.mesh.add(well); // Add well to the planet's mesh
 
@@ -608,13 +634,15 @@
     // ---------- Trajectory preview (payload) ----------
     function createPreviewLine(maxPoints, color) {
       const positions = new Float32Array(maxPoints * 3);
+      const colors = new Float32Array(maxPoints * 3);
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
       geometry.setDrawRange(0, 0);
-      const material = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.8 });
+      const material = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.8, vertexColors: true });
       const line = new THREE.Line(geometry, material);
       line.frustumCulled = false;
-      return { line, positions, geometry, maxPoints };
+      return { line, positions, geometry, maxPoints, colors };
     }
     const preview = {
       enabled: false,
@@ -627,7 +655,12 @@
     preview.payload.line.visible = false;
 
     function computePayloadPreview() {
+      hitMarker.visible = false;
+      closestApproachMarker.visible = false;
+      document.getElementById('preview-info').textContent = '';
+
       const positions = preview.payload.positions;
+      const colors = preview.payload.colors;
       const steps = Math.max(2, Math.min(preview.steps, preview.payload.maxPoints));
       const dt = preview.horizonYears / (steps - 1);
       // Start from TARS with hypothetical release DV (vector-only)
@@ -638,7 +671,17 @@
       let p = startPos.clone();
       let v = startVel.clone();
       // Snapshot planet states (position in AU) and integrate them for consistent N-body preview
-      const planetStates = planets.map(pl => ({ name: pl.name, pos: pl.position.clone(), vel: pl.velocity.clone() }));
+      const planetStates = planets.map(pl => ({ name: pl.name, pos: pl.position.clone(), vel: pl.velocity.clone(), hillRadiusAU: pl.hillRadiusAU }));
+      
+      let closestApproaches = planets.map(pl => ({
+        planetName: pl.name,
+        distanceSq: Infinity,
+        payloadPos: null,
+        payloadVel: null,
+        planetPos: null,
+        planetVel: null,
+      }));
+
       function localAccel(posAU) {
         // Sun term
         const r2 = posAU.lengthSq();
@@ -654,18 +697,55 @@
         }
         return a;
       }
+
+      let hitStep = -1;
+      let hitPlanetName = '';
+
       for (let i = 0; i < steps; i++) {
         // write world positions in render units
         positions[i*3+0] = p.x * SCALE;
         positions[i*3+1] = p.y * SCALE;
         positions[i*3+2] = p.z * SCALE;
+
+        // coloring
+        const speed = v.length();
+        const color = new THREE.Color();
+        const t = Math.min(1, speed / 1.0); // Normalize speed to [0, 1] for color
+        color.setHSL(0.7 * (1 - t), 1.0, 0.5);
+        colors[i*3+0] = color.r;
+        colors[i*3+1] = color.g;
+        colors[i*3+2] = color.b;
+
+        // Check for intersection and closest approach
+        for (let j = 0; j < planetStates.length; j++) {
+            const st = planetStates[j];
+            const distanceSq = p.distanceToSquared(st.pos);
+            if (distanceSq < closestApproaches[j].distanceSq) {
+                closestApproaches[j].distanceSq = distanceSq;
+                closestApproaches[j].payloadPos = p.clone();
+                closestApproaches[j].payloadVel = v.clone();
+                closestApproaches[j].planetPos = st.pos.clone();
+                closestApproaches[j].planetVel = st.vel.clone();
+            }
+            if (hitStep === -1 && st.hillRadiusAU && distanceSq < st.hillRadiusAU * st.hillRadiusAU) {
+                hitStep = i;
+                hitPlanetName = st.name;
+                hitMarker.position.set(p.x * SCALE, p.y * SCALE, p.z * SCALE);
+                hitMarker.visible = true;
+            }
+        }
+
+        if (hitStep !== -1) {
+          break;
+        }
+
         // advance one step with velocity-Verlet using local N-body accel
         const a0 = localAccel(p.clone());
         v.addScaledVector(a0, dt * 0.5);
         p.addScaledVector(v, dt);
         const a1 = localAccel(p.clone());
         v.addScaledVector(a1, dt * 0.5);
-        // advance planet states with Sun gravity only (planet-planet neglected as in main sim)
+        // advance planet states with Sun gravity only
         for (const st of planetStates) {
           const a0p = sunAccelAUPerYr2(st.pos.clone());
           st.vel.addScaledVector(a0p, dt * 0.5);
@@ -675,7 +755,38 @@
         }
       }
       preview.payload.geometry.attributes.position.needsUpdate = true;
-      preview.payload.geometry.setDrawRange(0, steps);
+      preview.payload.geometry.attributes.color.needsUpdate = true;
+      const drawCount = (hitStep !== -1) ? hitStep + 1 : steps;
+      preview.payload.geometry.setDrawRange(0, drawCount);
+
+      // Update HUD
+      const previewInfo = document.getElementById('preview-info');
+      if (hitStep !== -1) {
+          const hitApproach = closestApproaches.find(a => a.planetName === hitPlanetName);
+          const relVel = new THREE.Vector3().subVectors(hitApproach.payloadVel, hitApproach.planetVel);
+          const relSpeedMps = auPerYrToMps(relVel.length());
+          previewInfo.textContent = `Impact: ${hitPlanetName} at ${relSpeedMps.toFixed(0)} m/s`;
+      } else {
+          let overallClosest = { distanceSq: Infinity };
+          for (const approach of closestApproaches) {
+              if (approach.distanceSq < overallClosest.distanceSq) {
+                  overallClosest = approach;
+              }
+          }
+          if (overallClosest.payloadPos) {
+              closestApproachMarker.position.set(
+                  overallClosest.payloadPos.x * SCALE,
+                  overallClosest.payloadPos.y * SCALE,
+                  overallClosest.payloadPos.z * SCALE
+              );
+              closestApproachMarker.visible = true;
+              const relVel = new THREE.Vector3().subVectors(overallClosest.payloadVel, overallClosest.planetVel);
+              const relSpeedMps = auPerYrToMps(relVel.length());
+              const distKm = Math.sqrt(overallClosest.distanceSq) * SCALE;
+              previewInfo.textContent = `Closest approach: ${overallClosest.planetName} (${distKm.toExponential(2)} km at ${relSpeedMps.toFixed(0)} m/s)`;
+          }
+      }
+
       preview.dirty = false;
     }
 
@@ -724,6 +835,11 @@
     hudMsg.style.color = '#ffd166';
     hudMsg.style.fontStyle = 'italic';
     hud.appendChild(hudMsg);
+    const previewInfo = document.createElement('div');
+    previewInfo.id = 'preview-info';
+    previewInfo.style.marginTop = '6px';
+    previewInfo.style.color = '#66ccff';
+    hud.appendChild(previewInfo);
     function flashHudMessage(msg) {
       hudMsg.textContent = msg;
       clearTimeout(hudMsg._t);
@@ -915,17 +1031,7 @@
       Uranus: 25362,
       Neptune: 24622
     };
-    // Approx planet mass ratios (Mplanet / MSun)
-    const planetMassRatio = {
-      Mercury: 1.651e-7,
-      Venus:   2.447e-6,
-      Earth:   3.003e-6,
-      Mars:    3.227e-7,
-      Jupiter: 9.5479e-4,
-      Saturn:  2.858e-4,
-      Uranus:  4.366e-5,
-      Neptune: 5.151e-5
-    };
+    
     function desiredRenderRadiusUnits(name) {
       const km = planetRadiusKm[name];
       if (!km) return null;
@@ -1041,6 +1147,34 @@
     const _oldModeOnChange = modeSel.onchange;
     drawAimBall();
 
+    const aimBallState = {
+        pos: { u: 0, v: 0 },
+        vel: { u: 0, v: 0 },
+        accumulatedVel: { u: 0, v: 0 },
+        dragging: false,
+        lastPointer: { x: 0, y: 0, time: 0 },
+        friction: 0.95,
+    };
+
+    function updateAimBallInertia(dt) {
+        if (aimBallState.dragging) return;
+
+        const speed = Math.sqrt(aimBallState.vel.u * aimBallState.vel.u + aimBallState.vel.v * aimBallState.vel.v);
+        if (speed < 0.01) {
+            aimBallState.vel = { u: 0, v: 0 };
+            return;
+        }
+
+        const friction = Math.pow(aimBallState.friction, dt * 60);
+        aimBallState.vel.u *= friction;
+        aimBallState.vel.v *= friction;
+
+        aimBallState.pos.u += aimBallState.vel.u * dt;
+        aimBallState.pos.v += aimBallState.vel.v * dt;
+
+        setVectorFromBallPoint(aimBallState.pos.u, aimBallState.pos.v, true);
+    }
+
     function basisForAim() {
       // Camera-oriented basis so the aim ball center aligns with camera center
       const forward = new THREE.Vector3();
@@ -1102,25 +1236,54 @@
     }
 
     (function initAimBallEvents(){
-      let dragging = false;
       aimBallCanvas.addEventListener('pointerdown', (e)=>{
-        dragging = true; aimBallCanvas.setPointerCapture?.(e.pointerId);
+        aimBallState.dragging = true;
+        aimBallState.vel = { u: 0, v: 0 };
+        aimBallState.accumulatedVel = { u: 0, v: 0 };
+        aimBallCanvas.setPointerCapture?.(e.pointerId);
         const rect = aimBallCanvas.getBoundingClientRect();
         const x = (e.clientX - rect.left); const y = (e.clientY - rect.top);
         const cx = rect.width/2, cy = rect.height/2, R = Math.min(rect.width, rect.height)*0.48;
         const u = (x - cx)/R, v = -(y - cy)/R;
+        
+        aimBallState.pos = { u, v };
+        aimBallState.lastPointer = { x, y, time: performance.now() };
+
         setVectorFromBallPoint(u, v, false);
       });
       aimBallCanvas.addEventListener('pointermove', (e)=>{
-        if (!dragging) return;
+        if (!aimBallState.dragging) return;
         const rect = aimBallCanvas.getBoundingClientRect();
         const x = (e.clientX - rect.left); const y = (e.clientY - rect.top);
         const cx = rect.width/2, cy = rect.height/2, R = Math.min(rect.width, rect.height)*0.48;
         const u = (x - cx)/R, v = -(y - cy)/R;
+
+        const now = performance.now();
+        const dt = (now - aimBallState.lastPointer.time) / 1000;
+        if (dt > 0.001) {
+            const new_u_vel = (u - aimBallState.pos.u) / dt;
+            const new_v_vel = (v - aimBallState.pos.v) / dt;
+            // Accumulate velocity with some smoothing
+            aimBallState.accumulatedVel.u = aimBallState.accumulatedVel.u * 0.5 + new_u_vel * 0.5;
+            aimBallState.accumulatedVel.v = aimBallState.accumulatedVel.v * 0.5 + new_v_vel * 0.5;
+        }
+        
+        aimBallState.pos = { u, v };
+        aimBallState.lastPointer = { x, y, time: now };
+
         setVectorFromBallPoint(u, v, false);
       });
-      aimBallCanvas.addEventListener('pointerup', (e)=>{ dragging = false; aimBallCanvas.releasePointerCapture?.(e.pointerId); });
-      aimBallCanvas.addEventListener('pointerleave', ()=>{ dragging = false; });
+      aimBallCanvas.addEventListener('pointerup', (e)=>{ 
+        aimBallState.dragging = false; 
+        aimBallCanvas.releasePointerCapture?.(e.pointerId);
+        aimBallState.vel = aimBallState.accumulatedVel;
+      });
+      aimBallCanvas.addEventListener('pointerleave', ()=>{ 
+        if (aimBallState.dragging) {
+            aimBallState.dragging = false;
+            aimBallState.vel = aimBallState.accumulatedVel;
+        }
+      });
     })();
 
     
@@ -1216,6 +1379,7 @@
     updateAzElInputs();
 
     function mpsToAUPerYr(mps) { return mps * (1/149597870700) * (365.25*24*3600); }
+    function auPerYrToMps(auPerYr) { return auPerYr * 149597870700 / (365.25*24*3600); }
     function computeSpinDvAUPerYr() {
       // tip speed [m/s] = spin [rad/s] * (tipScaleMSPerRad)
       const dv_mps = Math.max(0, tars.spin) * payloadState.tipScaleMSPerRad;
@@ -1297,7 +1461,7 @@
     btnSlower.onclick = () => { setMultiplier(state.timeScaleMultiplier / 1.6); };
     btnSpin.onclick = () => {
       // Boost spin directly (no reserves)
-      tars.spin += physics.spinGainK * 0.5 * REALTIME_YEARS_PER_SEC; // small bump
+      // tars.spin += physics.spinGainK * 0.5 * REALTIME_YEARS_PER_SEC; // small bump
     };
     btnOrbits.onclick = () => {
       state.showOrbits = !state.showOrbits;
@@ -1315,6 +1479,12 @@
       state.showTrails = !state.showTrails;
       tarsTrail.line.visible = state.showTrails;
       for (const pl of simObjects.payloads) if (pl.trail && pl.trail.line) pl.trail.line.visible = state.showTrails;
+    };
+    btnWells.onclick = () => {
+      state.showGravityWells = !state.showGravityWells;
+      for (const well of gravityWells) {
+        well.visible = state.showGravityWells;
+      }
     };
     btnResetView.onclick = () => frameFocus(true);
     speedInput.oninput = () => { setMultiplier(Math.pow(10, parseFloat(speedInput.value))); }; // Convert back to linear
@@ -1449,6 +1619,8 @@
       const now = performance.now();
       const realDtSeconds = Math.max(0, (now - lastMs) / 1000);
       lastMs = now;
+
+      updateAimBallInertia(realDtSeconds);
 
       // Convert to sim years and clamp step for stability with substeps
       let dtYears = (state.paused ? 0 : realDtSeconds * state.timeScaleYearsPerSec);
@@ -1594,6 +1766,16 @@
         const distance = camera.position.distanceTo(label.getWorldPosition(new THREE.Vector3()));
         const scale = distance * 0.05;
         label.scale.set(scale, scale, 1);
+      }
+      if (hitMarker.visible) {
+        const distance = camera.position.distanceTo(hitMarker.position);
+        const scale = distance * 0.01; // Adjust this factor for desired screen size
+        hitMarker.scale.set(scale, scale, scale);
+      }
+      if (closestApproachMarker.visible) {
+        const distance = camera.position.distanceTo(closestApproachMarker.position);
+        const scale = distance * 0.008; // Adjust this factor for desired screen size
+        closestApproachMarker.scale.set(scale, scale, scale);
       }
       // If following, keep offset implicit; no overwrite to preserve user zoom/orbit
       // Redraw aim ball when camera rotates so the aimpoint remains consistent relative to screen center
