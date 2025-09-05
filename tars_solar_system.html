@@ -168,7 +168,7 @@
 
     function createSun() {
       const sunGeom = new THREE.SphereGeometry(695700, 48, 32);
-      const sunTexture = new THREE.TextureLoader().load('https://i.imgur.com/fhPbfIs.jpeg');
+      const sunTexture = new THREE.TextureLoader().load('./vendor/sun_texture.jpg');
       const sunMat = new THREE.MeshBasicMaterial({ map: sunTexture });
       const sun = new THREE.Mesh(sunGeom, sunMat);
       sun.name = 'Sun';
@@ -182,6 +182,7 @@
 
     // Orbit guide helper (circles)
     const orbitGuides = [];
+    const gravityWells = []; // New array for gravity wells
     function addOrbitGuide(radiusAU, color = 0xffffff, opacity = 0.07) {
       const segments = 512;
       const geometry = new THREE.BufferGeometry();
@@ -195,6 +196,24 @@
       geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
       const material = new THREE.LineBasicMaterial({ color, transparent: true, opacity });
       const line = new THREE.LineLoop(geometry, material);
+      scene.add(line);
+      return line;
+    }
+
+    function addGravityWell(radiusAU, color = 0xffffff, opacity = 0.15) {
+      const segments = 128;
+      const geometry = new THREE.BufferGeometry();
+      const positions = new Float32Array(segments * 3);
+      for (let i = 0; i < segments; i++) {
+        const a = (i / segments) * Math.PI * 2;
+        positions[3*i+0] = Math.cos(a) * radiusAU * SCALE;
+        positions[3*i+1] = 0;
+        positions[3*i+2] = Math.sin(a) * radiusAU * SCALE;
+      }
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      const material = new THREE.LineBasicMaterial({ color, transparent: true, opacity });
+      const line = new THREE.LineLoop(geometry, material);
+      gravityWells.push(line); // Add to the array
       scene.add(line);
       return line;
     }
@@ -214,6 +233,13 @@
       orbitGuides.push(line);
       const body = new Body({ name: p.name, mass: 1, radiusRender: p.r, color: p.color, semiMajorAU: p.a, initialPhase: Math.random() * Math.PI * 2, parent: 'Sun' });
       body.mesh.userData.baseRenderRadius = p.r;
+
+      // Calculate and add gravity well
+      const massRatio = planetMassRatio[p.name] || 0;
+      const hillRadiusAU = p.a * Math.pow(massRatio / 3, 1/3);
+      const well = addGravityWell(hillRadiusAU, p.color, 0.15);
+      body.mesh.add(well); // Add well to the planet's mesh
+
       return body;
     });
 
@@ -606,7 +632,7 @@
       const dt = preview.horizonYears / (steps - 1);
       // Start from TARS with hypothetical release DV (vector-only)
       const startPos = tars.position.clone();
-      const dir = new THREE.Vector3(-payloadState.vecX, payloadState.vecY, payloadState.vecZ).normalize();
+      const dir = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ).normalize();
       const dvAUPerYr = mpsToAUPerYr(payloadState.dvMag);
       const startVel = tars.velocity.clone().addScaledVector(dir, dvAUPerYr);
       let p = startPos.clone();
@@ -706,13 +732,14 @@
     const state = {
       simYears: 0,
       paused: false,
-      followTARS: true,
+      followTARS: false,
       followOffset: null,
       prevFollowTarget: null,
       showOrbits: true,
       showStarfield: true,
       showLabels: true,
       showTrails: true,
+      showGravityWells: true, // New state for gravity wells
       timeScaleMultiplier: 100, // 100x realtime by default
       timeScaleYearsPerSec: 100 * REALTIME_YEARS_PER_SEC,
       focus: 'TARS'
@@ -767,6 +794,7 @@
     const btnStars = document.createElement('button'); btnStars.textContent = 'Toggle Stars';
     const btnLabels = document.createElement('button'); btnLabels.textContent = 'Toggle Labels';
     const btnTrails = document.createElement('button'); btnTrails.textContent = 'Toggle Trails';
+    const btnWells = document.createElement('button'); btnWells.textContent = 'Toggle Wells'; // New button
     const btnResetView = document.createElement('button'); btnResetView.textContent = 'Reset View';
 
     // Time slider
@@ -808,7 +836,7 @@
     const row2 = document.createElement('div'); row2.className = 'row';
     row2.appendChild(btnFaster); row2.appendChild(btnSlower); row2.appendChild(btnSpin); row2.appendChild(focusSelect);
     const row3 = document.createElement('div'); row3.className = 'row';
-    row3.appendChild(btnOrbits); row3.appendChild(btnStars); row3.appendChild(btnLabels); row3.appendChild(btnTrails);
+    row3.appendChild(btnOrbits); row3.appendChild(btnStars); row3.appendChild(btnLabels); row3.appendChild(btnTrails); row3.appendChild(btnWells);
     btnBar.appendChild(row1);
     btnBar.appendChild(row2);
     btnBar.appendChild(row3);
@@ -1018,7 +1046,7 @@
       const forward = new THREE.Vector3();
       camera.getWorldDirection(forward);
       const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion).normalize();
-      let right = new THREE.Vector3().crossVectors(up, forward);
+      let right = new THREE.Vector3().crossVectors(forward, up);
       if (right.lengthSq() < 1e-12) right = new THREE.Vector3(1, 0, 0);
       right.normalize();
       return { right, up, forward };
@@ -1070,7 +1098,7 @@
       const { right, up, forward } = basisForAim();
       const worldDir = new THREE.Vector3().addScaledVector(right, u).addScaledVector(up, v).addScaledVector(forward, w).normalize();
       setVectorFromDir(worldDir);
-      drawAimBall(); updateAzElInputs();
+      updateAzElInputs();
     }
 
     (function initAimBallEvents(){
@@ -1105,6 +1133,7 @@
       payloadState.vecX = d.x; payloadState.vecY = d.y; payloadState.vecZ = d.z; preview.dirty = true;
       // reflect in inputs
       try { vecX.value = String(payloadState.vecX.toFixed(3)); vecY.value = String(payloadState.vecY.toFixed(3)); vecZ.value = String(payloadState.vecZ.toFixed(3)); } catch {}
+      drawAimBall();
     }
     function onPointerDownAim(e) {
       if (!(payloadState.dvMode === 'vector' && state.focus === 'TARS')) return;
@@ -1118,16 +1147,22 @@
       if (!sightDrag.active) return;
       const dx = e.clientX - sightDrag.lastX;
       const dy = e.clientY - sightDrag.lastY;
-      sightDrag.lastX = e.clientX; sightDrag.lastY = e.clientY;
-      // Rotate current vector by camera-space right/up axes
-      const curr = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ);
-      if (curr.lengthSq() < 1e-12) curr.set(1,0,0);
-      curr.normalize();
-      const camForward = new THREE.Vector3(); camera.getWorldDirection(camForward);
+      sightDrag.lastX = e.clientX;
+      sightDrag.lastY = e.clientY;
+
+      const curr = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ).normalize();
+
+      // Get camera's up vector
       const camUp = new THREE.Vector3(0,1,0).applyQuaternion(camera.quaternion).normalize();
-      const camRight = new THREE.Vector3().crossVectors(camUp, camForward).normalize();
-      curr.applyAxisAngle(camUp, -dx * aimSense);
-      curr.applyAxisAngle(camRight, -dy * aimSense);
+
+      // Create a basis from the current aim direction
+      const right = new THREE.Vector3().crossVectors(camUp, curr).normalize();
+      const up = new THREE.Vector3().crossVectors(curr, right).normalize();
+
+      // Rotate the aim direction
+      curr.applyAxisAngle(up, -dx * aimSense);
+      curr.applyAxisAngle(right, -dy * aimSense);
+
       setVectorFromDir(curr);
       e.preventDefault();
     }
@@ -1197,7 +1232,7 @@
     function releasePayloadNow() {
       // Ejection direction and magnitude determine payload exit velocity relative to TARS.
       let dvAUPerYr = mpsToAUPerYr(payloadState.dvMag);
-      let dir = new THREE.Vector3(-payloadState.vecX, payloadState.vecY, payloadState.vecZ);
+      let dir = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ);
       if (dir.lengthSq() < 1e-12) dir.set(1,0,0);
       dir.normalize();
       // Track the single Δv quantity: payload exit speed in m/s
@@ -1340,6 +1375,7 @@
     controls.target.set(0, 0, 0);
     camera.lookAt(controls.target);
     frameFocus(true);
+    btnFollow.click();
     window.addEventListener('resize', () => {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
