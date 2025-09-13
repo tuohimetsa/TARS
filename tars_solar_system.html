@@ -9,7 +9,7 @@
     #hud {
       position: fixed; left: 10px; top: 10px; z-index: 10; padding: 8px 10px;
       background: rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.15); border-radius: 8px;
-      line-height: 1.2; font-size: 12px; white-space: pre; user-select: none; max-width: min(92vw, 720px);
+      line-height: 1.2; font-size: 12px; white-space: pre; user-select: none; max-width: min(92vw, 520px);
     }
     #legend { position: fixed; right: 10px; bottom: 10px; z-index: 10; font-size: 11px; opacity: 0.8; }
     a { color: #8ec7ff; text-decoration: none; }
@@ -816,6 +816,12 @@
 
       // Natural spin decay
       tars.spin = Math.max(0, tars.spin - physics.spinDecay * dtYears);
+
+      const gForce = (tars.spin * tars.spin * physics.sailLeverArm) / 9.8;
+      if (gForce > physics.maxGForce) {
+        flashHudMessage('TARS structural failure due to excessive G-force!');
+        resetTars();
+      }
     }
 
     // Initialize TARS orbital velocity for near-circular orbit at its radius
@@ -870,6 +876,7 @@
       const simDate = new Date(simMillis);
       const tipScale = (typeof payloadState !== 'undefined' && payloadState && Number.isFinite(payloadState.tipScaleMSPerRad)) ? payloadState.tipScaleMSPerRad : 10;
       const tipSpeedMps = Math.max(0, tars.spin) * tipScale;
+      const gForce = (tars.spin * tars.spin * physics.sailLeverArm) / 9.8;
       const potential_v_mps = physics.sailLeverArm * tars.spin;
       hudStats.textContent =
         `Real time: ${realNow.toLocaleString()}
@@ -881,8 +888,8 @@
         `Exit velocity (last): ${tars.lastExitVelocityMps.toFixed(2)} m/s
 ` +
         `Potential exit velocity: ${(potential_v_mps/1000).toFixed(2)} km/s
-` +
-        `Tip speed: ${tipSpeedMps.toFixed(1)} m/s
+` +        `Tip speed: ${tipSpeedMps.toFixed(1)} m/s
+` +        `G-force: ${gForce.toFixed(2)} G
 ` +
         `Spin: ${tars.spin.toFixed(3)} rad/s
 ` +
@@ -896,7 +903,7 @@
     const tabControls = document.createElement('button'); tabControls.className = 'tab-btn active'; tabControls.textContent = 'Controls';
     const tabPhysics = document.createElement('button'); tabPhysics.className = 'tab-btn'; tabPhysics.textContent = 'Physics';
     const tabGraphics = document.createElement('button'); tabGraphics.className = 'tab-btn'; tabGraphics.textContent = 'Graphics';
-    const tabLaunch = document.createElement('button'); tabLaunch.className = 'tab-btn'; tabLaunch.textContent = 'Launch Payload';
+    const tabLaunch = document.createElement('button'); tabLaunch.className = 'tab-btn'; tabLaunch.textContent = 'Payload';
     tabs.appendChild(tabControls); tabs.appendChild(tabPhysics); tabs.appendChild(tabGraphics); tabs.appendChild(tabLaunch);
     hud.appendChild(tabs);
 
@@ -986,6 +993,7 @@
     physForm.appendChild(makeField('muSun (AU^3/yr^2)', 'muSun', 0.001, 0.0001));
     physForm.appendChild(makeField('maxDt (yr)', 'maxDt', 0.0001, 0.00001));
     physForm.appendChild(makeField('spinDecay', 'spinDecay', 0.001, 0));
+    physForm.appendChild(makeField('Max G-force', 'maxGForce', 1, 1));
     physForm.appendChild(makeField('Sail Area (m^2)', 'sailArea', 100, 0));
     physForm.appendChild(makeField('Sail Lever Arm (m)', 'sailLeverArm', 1, 0));
     physForm.appendChild(makeField('Moment of Inertia (kg*m^2)', 'momentOfInertia', 1e7, 0));
@@ -1083,12 +1091,12 @@
     // ---------- Launch Payload panel (combined) ----------
     const payloadForm = document.createElement('div'); payloadForm.className = 'btnbar';
     const payloadState = {
-      dvMode: 'vector',
+      
       dvMag: 100,       // m/s
       vecX: 1, vecY: 0, vecZ: 0 // vector components in world frame (normalized when used)
     };
     function rowWrap(...nodes) { const r = document.createElement('div'); r.className = 'row'; nodes.forEach(n => r.appendChild(n)); return r; }
-    const modeSel = document.createElement('span'); modeSel.textContent = 'Vector';
+    
     
     // Custom vector inputs (visible in vector mode)
     const vecX = document.createElement('input'); vecX.type='number'; vecX.step='0.1'; vecX.value=String(payloadState.vecX);
@@ -1098,17 +1106,18 @@
     const vecRow = rowWrap(document.createTextNode('Vector (x,y,z):'), vecX, vecY, vecZ);
     function refreshVectorRowVisibility(){ vecRow.style.display = ''; }
     refreshVectorRowVisibility();
-    const btnRelease = document.createElement('button'); btnRelease.textContent='Release payload now';
-    const btnSpawn = document.createElement('button'); btnSpawn.textContent='Spawn test payload @TARS';
+    const btnLaunch = document.createElement('button');
+    btnLaunch.textContent = 'Launch';
+    btnLaunch.style.backgroundColor = '#ef4444';
+    btnLaunch.style.fontSize = '16px';
+    btnLaunch.style.padding = '8px 16px';
     const btnClear = document.createElement('button'); btnClear.textContent='Clear payloads';
-    payloadForm.appendChild(rowWrap(modeSel, btnRelease, btnSpawn, btnClear));
+    payloadForm.appendChild(rowWrap(btnLaunch, btnClear));
     payloadForm.appendChild(vecRow);
     // Targeting subset
     const targetForm = document.createElement('div'); targetForm.className = 'btnbar';
     const targetState = { mode: 'none', body: 'None', point: null };
-    const targetSel = document.createElement('select');
-    ['None','Sun','Mercury','Venus','Earth','Mars','Jupiter','Saturn','Uranus','Neptune','Point'].forEach(n=>{ const o=document.createElement('option'); o.value=n; o.textContent=n; targetSel.appendChild(o); });
-    targetSel.onchange = ()=>{ targetState.body = targetSel.value; if (targetSel.value !== 'Point') targetState.point = null; };
+    
     
     const previewToggle = document.createElement('button'); previewToggle.textContent = 'Preview: Off';
     previewToggle.onclick = ()=>{ preview.enabled = !preview.enabled; preview.payload.line.visible = preview.enabled; preview.dirty = true; previewToggle.textContent = `Preview: ${preview.enabled ? 'On' : 'Off'}`; };
@@ -1118,7 +1127,7 @@
     const stepsLabel = document.createElement('label'); stepsLabel.textContent = 'Steps';
     const stepsInput = document.createElement('input'); stepsInput.type='number'; stepsInput.step='10'; stepsInput.min='10'; stepsInput.max='2000'; stepsInput.value = String(preview.steps);
     stepsInput.onchange = ()=>{ const s = Math.min(2000, Math.max(10, parseInt(stepsInput.value)||300)); preview.steps = s; preview.dirty = true; };
-    targetForm.appendChild(rowWrap(targetSel));
+    
     targetForm.appendChild(rowWrap(previewToggle, horizonLabel, horizonInput, stepsLabel, stepsInput));
     panelLaunch.appendChild(payloadForm);
     panelLaunch.appendChild(targetForm);
@@ -1156,8 +1165,7 @@
 
     function updateAimBallVisibility() { aimBallWrap.style.display = ''; }
     updateAimBallVisibility();
-    // integrate with existing modeSel handler
-    const _oldModeOnChange = modeSel.onchange;
+    
     drawAimBall();
 
     const aimBallState = {
@@ -1329,7 +1337,7 @@
       drawAimBall();
     }
     function onPointerDownAim(e) {
-      if (!(payloadState.dvMode === 'vector' && state.focus === 'TARS')) return;
+      if (!(state.focus === 'TARS')) return;
       if (!e.shiftKey) return;
       sightDrag.active = true; sightDrag.lastX = e.clientX; sightDrag.lastY = e.clientY;
       try { renderer.domElement.setPointerCapture(e.pointerId); } catch {}
@@ -1442,10 +1450,7 @@
       };
       spawnPayload(init);
     }
-    btnRelease.onclick = releasePayloadNow;
-    btnSpawn.onclick = ()=>{
-      spawnPayload({ position: tars.position.clone(), velocity: tars.velocity.clone(), color: 0x99ffcc });
-    };
+    btnLaunch.onclick = releasePayloadNow;
     btnClear.onclick = ()=>{
       [...simObjects.payloads.map(p=>p.id)].forEach(despawnById);
     };
@@ -1863,7 +1868,7 @@
     btnRadIn.onclick = () => { const { radial } = getOrthoBasis(); tryApplyDv(radial.multiplyScalar(-1), DV); };
     btnNormUp.onclick = () => { const { normal } = getOrthoBasis(); tryApplyDv(normal, DV); };
     btnNormDn.onclick = () => { const { normal } = getOrthoBasis(); tryApplyDv(normal.multiplyScalar(-1), DV); };
-    btnResetTars.onclick = () => {
+    function resetTars() {
       tars.position.set(1.0, 0, 0.01);
       const r = Math.sqrt(tars.position.lengthSq());
       const v = Math.sqrt(physics.muSun / r);
@@ -1884,7 +1889,8 @@
         preview.payload.line.visible = false;
         preview.dirty = true;
       }
-    };
+    }
+    btnResetTars.onclick = resetTars;
   </script>
 </body>
 </html>
