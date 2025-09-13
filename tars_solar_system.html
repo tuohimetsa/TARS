@@ -666,7 +666,8 @@
       // Start from TARS with hypothetical release DV (vector-only)
       const startPos = tars.position.clone();
       const dir = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ).normalize();
-      const dvAUPerYr = mpsToAUPerYr(payloadState.dvMag);
+      const v_mps = physics.sailLeverArm * tars.spin;
+      const dvAUPerYr = mpsToAUPerYr(v_mps);
       const startVel = tars.velocity.clone().addScaledVector(dir, dvAUPerYr);
       let p = startPos.clone();
       let v = startVel.clone();
@@ -711,7 +712,7 @@
         const speed = v.length();
         const color = new THREE.Color();
         const t = Math.min(1, speed / 1.0); // Normalize speed to [0, 1] for color
-        color.setHSL(0.7 * (1 - t), 1.0, 0.5);
+        color.setHSL(0.7 * (1 - t), 1.0, state.previewBrightness);
         colors[i*3+0] = color.r;
         colors[i*3+1] = color.g;
         colors[i*3+2] = color.b;
@@ -856,6 +857,7 @@
       showLabels: true,
       showTrails: true,
       showGravityWells: true, // New state for gravity wells
+      previewBrightness: 0.5,
       timeScaleMultiplier: 100, // 100x realtime by default
       timeScaleYearsPerSec: 100 * REALTIME_YEARS_PER_SEC,
       focus: 'TARS'
@@ -868,14 +870,24 @@
       const simDate = new Date(simMillis);
       const tipScale = (typeof payloadState !== 'undefined' && payloadState && Number.isFinite(payloadState.tipScaleMSPerRad)) ? payloadState.tipScaleMSPerRad : 10;
       const tipSpeedMps = Math.max(0, tars.spin) * tipScale;
+      const potential_v_mps = physics.sailLeverArm * tars.spin;
       hudStats.textContent =
-        `Real time: ${realNow.toLocaleString()}\n` +
-        `Sim time: ${simDate.toLocaleString()} (Δ ${state.simYears.toFixed(2)} years)\n` +
-        `TARS @ ${r.toFixed(3)} AU\n` +
-        `Exit velocity (last): ${tars.lastExitVelocityMps.toFixed(2)} m/s\n` +
-        `Tip speed: ${tipSpeedMps.toFixed(1)} m/s\n` +
-        `Spin: ${tars.spin.toFixed(3)} rad/s\n` +
-        `Time scale: ${state.timeScaleMultiplier.toLocaleString()}x realtime (${state.timeScaleYearsPerSec.toExponential(3)} y/s)\n` +
+        `Real time: ${realNow.toLocaleString()}
+` +
+        `Sim time: ${simDate.toLocaleString()} (Δ ${state.simYears.toFixed(2)} years)
+` +
+        `TARS @ ${r.toFixed(3)} AU
+` +
+        `Exit velocity (last): ${tars.lastExitVelocityMps.toFixed(2)} m/s
+` +
+        `Potential exit velocity: ${(potential_v_mps/1000).toFixed(2)} km/s
+` +
+        `Tip speed: ${tipSpeedMps.toFixed(1)} m/s
+` +
+        `Spin: ${tars.spin.toFixed(3)} rad/s
+` +
+        `Time scale: ${state.timeScaleMultiplier.toLocaleString()}x realtime (${state.timeScaleYearsPerSec.toExponential(3)} y/s)
+` +
         `Focus: ${state.focus}`;
     }
 
@@ -1009,6 +1021,8 @@
     // Orbit guide opacity
     const initialOrbitOpacity = (orbitGuides[0] && orbitGuides[0].material && orbitGuides[0].material.opacity) || 0.06;
     gfxForm.appendChild(makeGfxSlider('Orbit opacity', 0, 1, 0.02, initialOrbitOpacity, (v)=>{ for (const l of orbitGuides) { if (l.material && l.material.transparent) l.material.opacity = v; } }));
+    // Preview brightness
+    gfxForm.appendChild(makeGfxSlider('Preview brightness', 0, 1, 0.05, state.previewBrightness, (v)=>{ state.previewBrightness = v; preview.dirty = true; }));
     // Background color
     const bgRow = document.createElement('div'); bgRow.className='row';
     const bgLbl = document.createElement('label'); bgLbl.textContent = 'Background';
@@ -1069,14 +1083,13 @@
     // ---------- Launch Payload panel (combined) ----------
     const payloadForm = document.createElement('div'); payloadForm.className = 'btnbar';
     const payloadState = {
+      dvMode: 'vector',
       dvMag: 100,       // m/s
       vecX: 1, vecY: 0, vecZ: 0 // vector components in world frame (normalized when used)
     };
     function rowWrap(...nodes) { const r = document.createElement('div'); r.className = 'row'; nodes.forEach(n => r.appendChild(n)); return r; }
     const modeSel = document.createElement('span'); modeSel.textContent = 'Vector';
-    const dvLbl = document.createElement('label'); dvLbl.textContent = 'Δv (m/s)';
-    const dvInput = document.createElement('input'); dvInput.type='number'; dvInput.step='1'; dvInput.value=String(payloadState.dvMag);
-    dvInput.onchange = ()=> { const v = parseFloat(dvInput.value)||0; payloadState.dvMag = v; preview.dirty = true; };
+    
     // Custom vector inputs (visible in vector mode)
     const vecX = document.createElement('input'); vecX.type='number'; vecX.step='0.1'; vecX.value=String(payloadState.vecX);
     const vecY = document.createElement('input'); vecY.type='number'; vecY.step='0.1'; vecY.value=String(payloadState.vecY);
@@ -1088,7 +1101,7 @@
     const btnRelease = document.createElement('button'); btnRelease.textContent='Release payload now';
     const btnSpawn = document.createElement('button'); btnSpawn.textContent='Spawn test payload @TARS';
     const btnClear = document.createElement('button'); btnClear.textContent='Clear payloads';
-    payloadForm.appendChild(rowWrap(modeSel, dvLbl, dvInput, btnRelease, btnSpawn, btnClear));
+    payloadForm.appendChild(rowWrap(modeSel, btnRelease, btnSpawn, btnClear));
     payloadForm.appendChild(vecRow);
     // Targeting subset
     const targetForm = document.createElement('div'); targetForm.className = 'btnbar';
@@ -1154,20 +1167,38 @@
         dragging: false,
         lastPointer: { x: 0, y: 0, time: 0 },
         friction: 0.95,
+        springK: 200.0, // Spring constant for pulling towards the cursor
+        damping: 25.0,   // Damping factor to prevent oscillation
+        targetPos: { u: 0, v: 0 },
     };
 
     function updateAimBallInertia(dt) {
-        if (aimBallState.dragging) return;
+        if (aimBallState.dragging) {
+            // Spring-like motion towards the cursor
+            const targetU = aimBallState.targetPos ? aimBallState.targetPos.u : 0;
+            const targetV = aimBallState.targetPos ? aimBallState.targetPos.v : 0;
 
-        const speed = Math.sqrt(aimBallState.vel.u * aimBallState.vel.u + aimBallState.vel.v * aimBallState.vel.v);
-        if (speed < 0.01) {
-            aimBallState.vel = { u: 0, v: 0 };
-            return;
+            const F_spring_u = (targetU - aimBallState.pos.u) * aimBallState.springK;
+            const F_spring_v = (targetV - aimBallState.pos.v) * aimBallState.springK;
+
+            const F_damp_u = -aimBallState.vel.u * aimBallState.damping;
+            const F_damp_v = -aimBallState.vel.v * aimBallState.damping;
+
+            const F_u = F_spring_u + F_damp_u;
+            const F_v = F_spring_v + F_damp_v;
+
+            aimBallState.vel.u += F_u * dt;
+            aimBallState.vel.v += F_v * dt;
+        } else {
+            // Inertial motion with friction
+            const speed = Math.sqrt(aimBallState.vel.u * aimBallState.vel.u + aimBallState.vel.v * aimBallState.vel.v);
+            if (speed < 0.001) {
+                aimBallState.vel = { u: 0, v: 0 };
+            }
+            const friction = Math.pow(aimBallState.friction, dt * 60);
+            aimBallState.vel.u *= friction;
+            aimBallState.vel.v *= friction;
         }
-
-        const friction = Math.pow(aimBallState.friction, dt * 60);
-        aimBallState.vel.u *= friction;
-        aimBallState.vel.v *= friction;
 
         aimBallState.pos.u += aimBallState.vel.u * dt;
         aimBallState.pos.v += aimBallState.vel.v * dt;
@@ -1246,10 +1277,10 @@
         const cx = rect.width/2, cy = rect.height/2, R = Math.min(rect.width, rect.height)*0.48;
         const u = (x - cx)/R, v = -(y - cy)/R;
         
-        aimBallState.pos = { u, v };
+        aimBallState.targetPos = { u, v };
         aimBallState.lastPointer = { x, y, time: performance.now() };
 
-        setVectorFromBallPoint(u, v, false);
+        // No direct setting of position, let the spring do the work
       });
       aimBallCanvas.addEventListener('pointermove', (e)=>{
         if (!aimBallState.dragging) return;
@@ -1257,6 +1288,8 @@
         const x = (e.clientX - rect.left); const y = (e.clientY - rect.top);
         const cx = rect.width/2, cy = rect.height/2, R = Math.min(rect.width, rect.height)*0.48;
         const u = (x - cx)/R, v = -(y - cy)/R;
+
+        aimBallState.targetPos = { u, v };
 
         const now = performance.now();
         const dt = (now - aimBallState.lastPointer.time) / 1000;
@@ -1268,23 +1301,20 @@
             aimBallState.accumulatedVel.v = aimBallState.accumulatedVel.v * 0.5 + new_v_vel * 0.5;
         }
         
-        aimBallState.pos = { u, v };
         aimBallState.lastPointer = { x, y, time: now };
-
-        setVectorFromBallPoint(u, v, false);
       });
       aimBallCanvas.addEventListener('pointerup', (e)=>{ 
         aimBallState.dragging = false; 
         aimBallCanvas.releasePointerCapture?.(e.pointerId);
-        aimBallState.vel = aimBallState.accumulatedVel;
+        aimBallState.vel = { u: 0, v: 0 };
       });
       aimBallCanvas.addEventListener('pointerleave', ()=>{ 
         if (aimBallState.dragging) {
             aimBallState.dragging = false;
-            aimBallState.vel = aimBallState.accumulatedVel;
+            aimBallState.vel = { u: 0, v: 0 };
         }
       });
-    })();
+    })();;
 
     
 
@@ -1395,15 +1425,19 @@
 
     function releasePayloadNow() {
       // Ejection direction and magnitude determine payload exit velocity relative to TARS.
-      let dvAUPerYr = mpsToAUPerYr(payloadState.dvMag);
+      const r = physics.sailLeverArm; // Use sailLeverArm as the release radius
+      const w = tars.spin;
+      const v_mps = r * w;
+      let dvAUPerYr = mpsToAUPerYr(v_mps);
+
       let dir = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ);
       if (dir.lengthSq() < 1e-12) dir.set(1,0,0);
       dir.normalize();
       // Track the single Δv quantity: payload exit speed in m/s
-      tars.lastExitVelocityMps = dvAUPerYr * (149597870700) / (365.25*24*3600);
+      tars.lastExitVelocityMps = v_mps;
       const init = {
         position: tars.position.clone(),
-        velocity: new THREE.Vector3().copy(dir).multiplyScalar(dvAUPerYr),
+        velocity: tars.velocity.clone().add(new THREE.Vector3().copy(dir).multiplyScalar(dvAUPerYr)),
         color: 0x66ff88
       };
       spawnPayload(init);
@@ -1461,7 +1495,7 @@
     btnSlower.onclick = () => { setMultiplier(state.timeScaleMultiplier / 1.6); };
     btnSpin.onclick = () => {
       // Boost spin directly (no reserves)
-      // tars.spin += physics.spinGainK * 0.5 * REALTIME_YEARS_PER_SEC; // small bump
+      tars.spin += 0.1; // small bump
     };
     btnOrbits.onclick = () => {
       state.showOrbits = !state.showOrbits;
