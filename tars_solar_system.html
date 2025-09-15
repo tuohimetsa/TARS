@@ -55,7 +55,7 @@
     const C_LIGHT = 299792458; // m/s
     const L_SUN = 3.828e26; // Watts (luminosity of the sun)
     const physics = {
-      muSun: 1.0,                  // AU^3 / year^2
+      muSun: (2 * Math.PI) * (2 * Math.PI), // AU^3 / year^2 (Kepler's 3rd law for our units)
       maxDt: 1/3600,               // years
       spinDecay: 0.00,             // small natural decay
       nBodyAttractors: true,       // include planetary gravity on craft/payloads
@@ -753,7 +753,8 @@
                 closestApproaches[j].planetPos = st.pos.clone();
                 closestApproaches[j].planetVel = st.vel.clone();
             }
-            if (hitStep === -1 && st.hillRadiusAU && distanceSq < st.hillRadiusAU * st.hillRadiusAU) {
+            const planetRadiusAU = (planetRadiusKm[st.name] || 0) / KM_PER_AU;
+            if (hitStep === -1 && planetRadiusAU > 0 && distanceSq < planetRadiusAU * planetRadiusAU) {
                 hitStep = i;
                 hitPlanetName = st.name;
                 hitMarker.position.set(p.x * SCALE, p.y * SCALE, p.z * SCALE);
@@ -1055,7 +1056,7 @@
     gfxForm.appendChild(makeGfxSlider('Star size', 0.5, 6, 0.1, (starfield.material.size||3), (v)=>{ if (starfield.material) { starfield.material.size = v; starfield.material.needsUpdate = true; } }));
     // Orbit guide opacity
     const initialOrbitOpacity = (orbitGuides[0] && orbitGuides[0].material && orbitGuides[0].material.opacity) || 0.06;
-    gfxForm.appendChild(makeGfxSlider('Orbit opacity', 0, 1, 0.02, initialOrbitOpacity, (v)=>{ for (const l of orbitGuides) { if (l.material && l.material.transparent) l.material.opacity = v; } }));
+    gfxForm.appendChild(makeGfxSlider('Orbit opacity', 0, 1, 0.02, initialOrbitOpacity, (v)=>{ for (const l of orbitGuides) { if (l.material && l.material.transparent) l.material.opacity = v; } for (const w of gravityWells) { if (w.material && w.material.transparent) w.material.opacity = v; } }));
     // Preview brightness
     gfxForm.appendChild(makeGfxSlider('Preview brightness', 0, 1, 0.05, state.previewBrightness, (v)=>{ state.previewBrightness = v; preview.dirty = true; }));
     // Background color
