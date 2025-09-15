@@ -187,12 +187,36 @@
     hitMarker.visible = false;
     scene.add(hitMarker);
 
-    const closestApproachMarker = new THREE.Mesh(
-      new THREE.SphereGeometry(8000, 16, 16), // 8000 km radius
-      new THREE.MeshBasicMaterial({ color: 0xffff00, transparent: true, opacity: 0.7 })
+    const state = {
+      simYears: 0,
+      paused: false,
+      followTARS: false,
+      followOffset: null,
+      prevFollowTarget: null,
+      showOrbits: true,
+      showStarfield: true,
+      showLabels: true,
+      showTrails: true,
+      showGravityWells: true, // New state for gravity wells
+      previewBrightness: 0.5,
+      timeScaleMultiplier: 100, // 100x realtime by default
+      timeScaleYearsPerSec: 100 * REALTIME_YEARS_PER_SEC,
+      focus: 'TARS'
+    };
+    const allLabels = [];
+    const closestApproachLine = new THREE.Line(
+        new THREE.BufferGeometry(),
+        new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 })
     );
-    closestApproachMarker.visible = false;
-    scene.add(closestApproachMarker);
+    closestApproachLine.visible = false;
+    scene.add(closestApproachLine);
+
+    const ghostPlanet = new THREE.Mesh(
+        new THREE.SphereGeometry(1, 24, 16),
+        new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, transparent: true, opacity: 0.5 })
+    );
+    ghostPlanet.visible = false;
+    scene.add(ghostPlanet);
 
     // Orbit guide helper (circles)
     const orbitGuides = [];
@@ -656,7 +680,8 @@
 
     function computePayloadPreview() {
       hitMarker.visible = false;
-      closestApproachMarker.visible = false;
+      closestApproachLine.visible = false;
+      ghostPlanet.visible = false;
       document.getElementById('preview-info').textContent = '';
 
       const positions = preview.payload.positions;
@@ -775,12 +800,30 @@
               }
           }
           if (overallClosest.payloadPos) {
-              closestApproachMarker.position.set(
-                  overallClosest.payloadPos.x * SCALE,
-                  overallClosest.payloadPos.y * SCALE,
-                  overallClosest.payloadPos.z * SCALE
-              );
-              closestApproachMarker.visible = true;
+              const line_positions = new Float32Array(6);
+              line_positions[0] = overallClosest.payloadPos.x * SCALE;
+              line_positions[1] = overallClosest.payloadPos.y * SCALE;
+              line_positions[2] = overallClosest.payloadPos.z * SCALE;
+              line_positions[3] = overallClosest.planetPos.x * SCALE;
+              line_positions[4] = overallClosest.planetPos.y * SCALE;
+              line_positions[5] = overallClosest.planetPos.z * SCALE;
+              closestApproachLine.geometry.setAttribute('position', new THREE.BufferAttribute(line_positions, 3));
+              closestApproachLine.geometry.computeBoundingSphere();
+              closestApproachLine.visible = true;
+
+              const planet = planets.find(p => p.name === overallClosest.planetName);
+              if (planet) {
+                  ghostPlanet.geometry = planet.mesh.geometry.clone();
+                  ghostPlanet.material.color.set(planet.color);
+                  ghostPlanet.position.set(
+                      overallClosest.planetPos.x * SCALE,
+                      overallClosest.planetPos.y * SCALE,
+                      overallClosest.planetPos.z * SCALE
+                  );
+                  ghostPlanet.scale.copy(planet.mesh.scale);
+                  ghostPlanet.visible = true;
+              }
+
               const relVel = new THREE.Vector3().subVectors(overallClosest.payloadVel, overallClosest.planetVel);
               const relSpeedMps = auPerYrToMps(relVel.length());
               const distKm = Math.sqrt(overallClosest.distanceSq) * SCALE;
@@ -852,22 +895,6 @@
       clearTimeout(hudMsg._t);
       hudMsg._t = setTimeout(() => { hudMsg.textContent = ''; }, 1200);
     }
-    const state = {
-      simYears: 0,
-      paused: false,
-      followTARS: false,
-      followOffset: null,
-      prevFollowTarget: null,
-      showOrbits: true,
-      showStarfield: true,
-      showLabels: true,
-      showTrails: true,
-      showGravityWells: true, // New state for gravity wells
-      previewBrightness: 0.5,
-      timeScaleMultiplier: 100, // 100x realtime by default
-      timeScaleYearsPerSec: 100 * REALTIME_YEARS_PER_SEC,
-      focus: 'TARS'
-    };
 
     function updateHUD() {
       const r = Math.sqrt(tars.position.lengthSq());
@@ -1160,6 +1187,37 @@
     const aimBallRow = document.createElement('div'); aimBallRow.className='row';
     const aimBallCanvas = document.createElement('canvas'); aimBallCanvas.width = 300; aimBallCanvas.height = 300; aimBallCanvas.style.cursor='crosshair'; aimBallCanvas.title = 'Drag to aim (2D sphere)';
     aimBallRow.appendChild(aimBallCanvas);
+
+    const legendDiv = document.createElement('div');
+    legendDiv.style.display = 'flex';
+    legendDiv.style.flexDirection = 'column';
+    legendDiv.style.marginLeft = '10px';
+    legendDiv.style.fontSize = '12px';
+
+    function createLegendItem(color, text) {
+        const item = document.createElement('div');
+        item.style.display = 'flex';
+        item.style.alignItems = 'center';
+        item.style.marginBottom = '5px';
+        const colorBox = document.createElement('div');
+        colorBox.style.width = '10px';
+        colorBox.style.height = '10px';
+        colorBox.style.backgroundColor = color;
+        colorBox.style.marginRight = '5px';
+        const label = document.createElement('span');
+        label.textContent = text;
+        item.appendChild(colorBox);
+        item.appendChild(label);
+        return item;
+    }
+
+    legendDiv.appendChild(createLegendItem('#22c55e', 'Aim (front)'));
+    legendDiv.appendChild(createLegendItem('#ef4444', 'Aim (back)'));
+    legendDiv.appendChild(createLegendItem('blue', 'Prograde'));
+    legendDiv.appendChild(createLegendItem('orange', 'Retrograde'));
+
+    aimBallRow.appendChild(legendDiv);
+
     aimBallWrap.appendChild(aimBallRow);
     panelLaunch.appendChild(aimBallWrap);
 
@@ -1179,6 +1237,13 @@
         damping: 25.0,   // Damping factor to prevent oscillation
         targetPos: { u: 0, v: 0 },
     };
+
+    function updateAimBallFromWorldDir() {
+        const dir = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ).normalize();
+        const { right, up } = basisForAim();
+        aimBallState.pos.u = dir.dot(right);
+        aimBallState.pos.v = dir.dot(up);
+    }
 
     function updateAimBallInertia(dt) {
         if (aimBallState.dragging) {
@@ -1208,10 +1273,11 @@
             aimBallState.vel.v *= friction;
         }
 
-        aimBallState.pos.u += aimBallState.vel.u * dt;
-        aimBallState.pos.v += aimBallState.vel.v * dt;
-
-        setVectorFromBallPoint(aimBallState.pos.u, aimBallState.pos.v, true);
+        if (aimBallState.dragging || Math.abs(aimBallState.vel.u) > 1e-5 || Math.abs(aimBallState.vel.v) > 1e-5) {
+            aimBallState.pos.u += aimBallState.vel.u * dt;
+            aimBallState.pos.v += aimBallState.vel.v * dt;
+            setVectorFromBallPoint(aimBallState.pos.u, aimBallState.pos.v, true);
+        }
     }
 
     function basisForAim() {
@@ -1251,6 +1317,44 @@
       ctx.beginPath(); ctx.arc(px, py, 4, 0, Math.PI*2);
       ctx.fillStyle = (w >= 0) ? '#22c55e' : '#ef4444';
       ctx.fill(); ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.stroke();
+
+      // Prograde vector
+      const { prograde } = getOrthoBasis();
+      const prograde_u = prograde.dot(right);
+      const prograde_v = prograde.dot(up);
+      const prograde_w = prograde.dot(forward);
+
+      if (prograde_w >= 0) { // Only draw if it's on the visible hemisphere
+          const prograde_px = cx + (prograde_u * R);
+          const prograde_py = cy - (prograde_v * R);
+
+          ctx.beginPath();
+          ctx.arc(prograde_px, prograde_py, 4, 0, Math.PI*2);
+          ctx.fillStyle = 'blue';
+          ctx.fill();
+          ctx.strokeStyle = '#000';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+      }
+
+      // Retrograde vector
+      const retrograde = prograde.clone().negate();
+      const retrograde_u = retrograde.dot(right);
+      const retrograde_v = retrograde.dot(up);
+      const retrograde_w = retrograde.dot(forward);
+
+      if (retrograde_w >= 0) { // Only draw if it's on the visible hemisphere
+          const retrograde_px = cx + (retrograde_u * R);
+          const retrograde_py = cy - (retrograde_v * R);
+
+          ctx.beginPath();
+          ctx.arc(retrograde_px, retrograde_py, 4, 0, Math.PI*2);
+          ctx.fillStyle = 'orange';
+          ctx.fill();
+          ctx.strokeStyle = '#000';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+      }
     }
 
     function setVectorFromBallPoint(u, v, allowBack) {
@@ -1379,26 +1483,30 @@
     renderer.domElement.addEventListener('pointerup', onPointerUpAim);
     renderer.domElement.addEventListener('pointerleave', onPointerUpAim);
 
-    // Azimuth/elevation helpers operate in TARS-local frame (up = +Y, forward = radial tangent)
+    // Azimuth/elevation helpers operate in world frame (Y-up)
     function getAimDir() { return new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ).normalize(); }
     function setAimFromAzEl(azDeg, elDeg) {
       const az = azDeg * Math.PI/180, el = elDeg * Math.PI/180;
-      // Start from forward in xz-plane (use TARS-prograde basis)
-      const { prograde, radial } = getOrthoBasis();
+      // World-fixed basis
       const up = new THREE.Vector3(0,1,0);
-      const right = new THREE.Vector3().crossVectors(up, prograde).normalize();
+      const forward = new THREE.Vector3(0,0,1);
+      const right = new THREE.Vector3(1,0,0);
+
       // Build orientation: rotate around up by az, then around right by el
-      const dir = prograde.clone().applyAxisAngle(up, az).applyAxisAngle(right, el).normalize();
+      const dir = forward.clone().applyAxisAngle(up, az).applyAxisAngle(right, el).normalize();
       setVectorFromDir(dir);
     }
     function updateAzElInputs() {
       const dir = getAimDir();
-      const { prograde } = getOrthoBasis();
+      // World-fixed basis
       const up = new THREE.Vector3(0,1,0);
-      const right = new THREE.Vector3().crossVectors(up, prograde).normalize();
-      const forward = prograde;
-      // Compute azimuth/elevation from local basis
-      const x = dir.dot(right), y = dir.dot(up), z = dir.dot(forward);
+      const forward = new THREE.Vector3(0,0,1);
+      const right = new THREE.Vector3(1,0,0);
+
+      // Compute azimuth/elevation from world basis
+      const x = dir.dot(right);
+      const y = dir.dot(up);
+      const z = dir.dot(forward);
       const el = Math.asin(Math.max(-1, Math.min(1, y)));
       const az = Math.atan2(x, z);
       azInput.value = String((az*180/Math.PI).toFixed(0));
@@ -1509,10 +1617,9 @@
     btnStars.onclick = () => { state.showStarfield = !state.showStarfield; starfield.visible = state.showStarfield; };
     btnLabels.onclick = () => {
       state.showLabels = !state.showLabels;
-      for (const p of planets) if (p.label) p.label.visible = state.showLabels;
-      if (tarsLabel) tarsLabel.visible = state.showLabels;
-      for (const pl of simObjects.payloads) if (pl.label) pl.label.visible = state.showLabels;
-      for (const m of simObjects.markers) if (m.label) m.label.visible = state.showLabels;
+      for (const label of allLabels) {
+        label.visible = state.showLabels;
+      }
     };
     btnTrails.onclick = () => {
       state.showTrails = !state.showTrails;
@@ -1592,26 +1699,34 @@
     });
 
     // Labels via CanvasTexture sprites
-    const allLabels = [];
     function createLabelSprite(text) {
       const cnv = document.createElement('canvas');
       const ctx = cnv.getContext('2d');
-      const pad = 8; const fs = 28; const font = `${fs}px sans-serif`;
+      const fs = 24; // smaller font
+      const font = `bold ${fs}px sans-serif`;
       ctx.font = font;
-      const w = Math.ceil(ctx.measureText(text).width) + pad * 2;
-      const h = fs + pad * 2;
+      const w = Math.ceil(ctx.measureText(text).width) + 16;
+      const h = fs + 16;
       cnv.width = w; cnv.height = h;
-      ctx.font = font; ctx.textBaseline = 'top';
-      ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(0, 0, w, h);
-      ctx.strokeStyle = 'rgba(255,255,255,0.3)'; ctx.strokeRect(0, 0, w, h);
-      ctx.fillStyle = 'white'; ctx.fillText(text, pad, pad);
+
+      ctx.font = font;
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'center';
+
+      ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+      ctx.lineWidth = 4;
+      ctx.strokeText(text, w/2, h/2);
+
+      ctx.fillStyle = 'white';
+      ctx.fillText(text, w/2, h/2);
+
       const tex = new THREE.CanvasTexture(cnv);
       tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
       const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, depthWrite: false, transparent: true });
       const sprite = new THREE.Sprite(mat);
       sprite.userData.name = text;
       sprite.renderOrder = 9999;
-      sprite.renderOrder = 9999;
+      sprite.visible = state.showLabels; // Set initial visibility
       allLabels.push(sprite);
       return sprite;
     }
@@ -1625,7 +1740,7 @@
     
     // Label for TARS
     const tarsLabel = createLabelSprite('TARS');
-    tarsLabel.position.set(0, 2.0, 0);
+    tarsLabel.position.set(0, 4.0, 0);
     tarsLabel.visible = state.showLabels;
     tars.mesh.add(tarsLabel);
 
@@ -1811,15 +1926,14 @@
         const scale = distance * 0.01; // Adjust this factor for desired screen size
         hitMarker.scale.set(scale, scale, scale);
       }
-      if (closestApproachMarker.visible) {
-        const distance = camera.position.distanceTo(closestApproachMarker.position);
-        const scale = distance * 0.008; // Adjust this factor for desired screen size
-        closestApproachMarker.scale.set(scale, scale, scale);
-      }
+      
       // If following, keep offset implicit; no overwrite to preserve user zoom/orbit
       // Redraw aim ball when camera rotates so the aimpoint remains consistent relative to screen center
       if (!camera.quaternion.equals(prevCamQuat)) {
         prevCamQuat.copy(camera.quaternion);
+        if (!aimBallState.dragging) {
+            updateAimBallFromWorldDir();
+        }
         drawAimBall();
       }
       // Lazy-update preview
