@@ -1340,12 +1340,8 @@
     const elLbl = document.createElement('label'); elLbl.textContent='Elevation (°)';
     const azInput = document.createElement('input'); azInput.type='number'; azInput.step='0.1'; azInput.min='-180'; azInput.max='180'; azInput.style.width='80px';
     const elInput = document.createElement('input'); elInput.type='number'; elInput.step='0.1'; elInput.min='-89.9'; elInput.max='89.9'; elInput.style.width='80px';
-    const btnAzMinus = document.createElement('button'); btnAzMinus.textContent='Az -0.1°';
-    const btnAzPlus = document.createElement('button'); btnAzPlus.textContent='Az +0.1°';
-    const btnElMinus = document.createElement('button'); btnElMinus.textContent='El -0.1°';
-    const btnElPlus = document.createElement('button'); btnElPlus.textContent='El +0.1°';
-    aimRow2.appendChild(azLbl); aimRow2.appendChild(azInput); aimRow2.appendChild(btnAzMinus); aimRow2.appendChild(btnAzPlus);
-    aimRow2.appendChild(elLbl); aimRow2.appendChild(elInput); aimRow2.appendChild(btnElMinus); aimRow2.appendChild(btnElPlus);
+    aimRow2.appendChild(azLbl); aimRow2.appendChild(azInput);
+    aimRow2.appendChild(elLbl); aimRow2.appendChild(elInput);
     // Snap buttons
     const aimRow3 = document.createElement('div'); aimRow3.className='row';
     const btnSnapProg = document.createElement('button'); btnSnapProg.textContent = 'Snap: Prograde';
@@ -1689,10 +1685,6 @@
     }
     azInput.onchange = ()=> setAimFromAzEl(parseFloat(azInput.value)||0, parseFloat(elInput.value)||0);
     elInput.onchange = ()=> setAimFromAzEl(parseFloat(azInput.value)||0, parseFloat(elInput.value)||0);
-    btnAzMinus.onclick = ()=> setAimFromAzEl((parseFloat(azInput.value)||0) - 1, parseFloat(elInput.value)||0);
-    btnAzPlus.onclick = ()=> setAimFromAzEl((parseFloat(azInput.value)||0) + 1, parseFloat(elInput.value)||0);
-    btnElMinus.onclick = ()=> setAimFromAzEl(parseFloat(azInput.value)||0, (parseFloat(elInput.value)||0) - 1);
-    btnElPlus.onclick = ()=> setAimFromAzEl(parseFloat(azInput.value)||0, (parseFloat(elInput.value)||0) + 1);
     btnSnapProg.onclick = ()=>{ const { prograde } = getOrthoBasis(); setVectorFromDir(prograde); updateAzElInputs(); };
     btnSnapRad.onclick = ()=>{ const { radial } = getOrthoBasis(); setVectorFromDir(radial); updateAzElInputs(); };
     btnSnapNorm.onclick = ()=>{ const { normal } = getOrthoBasis(); setVectorFromDir(normal); updateAzElInputs(); };
