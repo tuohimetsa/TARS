@@ -203,6 +203,20 @@
       timeScaleYearsPerSec: 100 * REALTIME_YEARS_PER_SEC,
       focus: 'TARS'
     };
+    const autoAimState = {
+      running: false,
+      targetPlanetName: 'Mars',
+      iterations: 0,
+      maxIterations: 20000,
+      passes: 5,
+      searchSpace: 1.0,
+      searchSpaceDecay: 0.1,
+      best: {
+        dist: Infinity,
+        vec: new THREE.Vector3(),
+        time: 0,
+      }
+    };
     const allLabels = [];
     const closestApproachLine = new THREE.Line(
         new THREE.BufferGeometry(),
@@ -678,6 +692,69 @@
     scene.add(preview.payload.line);
     preview.payload.line.visible = false;
 
+    function calculateTrajectory(launchVec) {
+      const steps = Math.max(2, Math.min(preview.steps, preview.payload.maxPoints));
+      const dt = preview.horizonYears / (steps - 1);
+      const startPos = tars.position.clone();
+      const dir = launchVec.clone().normalize();
+      const v_mps = physics.sailLeverArm * tars.spin;
+      const dvAUPerYr = mpsToAUPerYr(v_mps);
+      const startVel = tars.velocity.clone().addScaledVector(dir, dvAUPerYr);
+      let p = startPos.clone();
+      let v = startVel.clone();
+      const planetStates = planets.map(pl => ({ name: pl.name, pos: pl.position.clone(), vel: pl.velocity.clone(), hillRadiusAU: pl.hillRadiusAU }));
+      let closestApproach = {
+        distanceSq: Infinity,
+        payloadPos: null,
+        payloadVel: null,
+        planetPos: null,
+        planetVel: null,
+      };
+
+      function localAccel(posAU) {
+        const r2 = posAU.lengthSq();
+        const r = Math.sqrt(r2) + 1e-12;
+        const a = posAU.clone().multiplyScalar(-physics.muSun / (r*r*r));
+        if (!physics.nBodyAttractors) return a;
+        for (const st of planetStates) {
+          const m = planetMassRatio[st.name]; if (!m) continue;
+          const rp = posAU.clone().sub(st.pos);
+          const r2p = rp.lengthSq();
+          const rpLen = Math.sqrt(r2p) + 1e-12;
+          a.add(rp.multiplyScalar(-physics.muSun * m / (rpLen*rpLen*rpLen)));
+        }
+        return a;
+      }
+
+      for (let i = 0; i < steps; i++) {
+        const targetPlanetState = planetStates.find(st => st.name === autoAimState.targetPlanetName);
+        if (targetPlanetState) {
+            const distanceSq = p.distanceToSquared(targetPlanetState.pos);
+            if (distanceSq < closestApproach.distanceSq) {
+                closestApproach.distanceSq = distanceSq;
+                closestApproach.payloadPos = p.clone();
+                closestApproach.payloadVel = v.clone();
+                closestApproach.planetPos = targetPlanetState.pos.clone();
+                closestApproach.planetVel = targetPlanetState.vel.clone();
+            }
+        }
+
+        const a0 = localAccel(p.clone());
+        v.addScaledVector(a0, dt * 0.5);
+        p.addScaledVector(v, dt);
+        const a1 = localAccel(p.clone());
+        v.addScaledVector(a1, dt * 0.5);
+        for (const st of planetStates) {
+          const a0p = sunAccelAUPerYr2(st.pos.clone());
+          st.vel.addScaledVector(a0p, dt * 0.5);
+          st.pos.addScaledVector(st.vel, dt);
+          const a1p = sunAccelAUPerYr2(st.pos.clone());
+          st.vel.addScaledVector(a1p, dt * 0.5);
+        }
+      }
+      return closestApproach;
+    }
+
     function computePayloadPreview() {
       hitMarker.visible = false;
       closestApproachLine.visible = false;
@@ -960,6 +1037,102 @@
     const btnWells = document.createElement('button'); btnWells.textContent = 'Toggle Wells'; // New button
     const btnResetView = document.createElement('button'); btnResetView.textContent = 'Reset View';
 
+    const autoAimForm = document.createElement('div'); autoAimForm.className = 'btnbar';
+    const autoAimRow = document.createElement('div'); autoAimRow.className = 'row';
+    const autoAimLabel = document.createElement('label'); autoAimLabel.textContent = 'Target Planet:';
+    const autoAimSelect = document.createElement('select');
+    for (const name of ['Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune']) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      if (name === 'Mars') opt.selected = true;
+      autoAimSelect.appendChild(opt);
+    }
+    const autoAimBtn = document.createElement('button'); autoAimBtn.textContent = 'Auto-Aim';
+    autoAimBtn.style.backgroundColor = '#22c55e';
+    autoAimBtn.onclick = () => {
+      if (autoAimState.running) return;
+      autoAimState.running = true;
+      autoAimState.targetPlanetName = autoAimSelect.value;
+      autoAimState.iterations = 0;
+      autoAimState.best.dist = Infinity;
+      autoAimBtn.style.display = 'none';
+      autoAimCancelBtn.style.display = 'inline-block';
+      autoAimInfo.textContent = `Searching for trajectory to ${autoAimState.targetPlanetName}...`;
+
+      const learningRate = 0.1;
+      const epsilon = 1e-6;
+      let currentVec = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ).normalize();
+
+      function searchStep() {
+        if (!autoAimState.running || autoAimState.iterations >= autoAimState.maxIterations) {
+          autoAimState.running = false;
+          autoAimBtn.style.display = 'inline-block';
+          autoAimCancelBtn.style.display = 'none';
+          if (autoAimState.best.dist === Infinity) {
+            autoAimInfo.textContent = 'No solution found.';
+          } else {
+            const distKm = Math.sqrt(autoAimState.best.dist) * SCALE;
+            autoAimInfo.textContent = `Best solution found: ${distKm.toExponential(2)} km`;
+          }
+          return;
+        }
+
+        const currentDist = calculateTrajectory(currentVec).distanceSq;
+        if (currentDist < autoAimState.best.dist) {
+          autoAimState.best.dist = currentDist;
+          autoAimState.best.vec.copy(currentVec);
+          payloadState.vecX = autoAimState.best.vec.x;
+          payloadState.vecY = autoAimState.best.vec.y;
+          payloadState.vecZ = autoAimState.best.vec.z;
+          preview.dirty = true;
+          const distKm = Math.sqrt(autoAimState.best.dist) * SCALE;
+          autoAimInfo.textContent = `Best solution so far: ${distKm.toExponential(2)} km`;
+        }
+
+        // Calculate gradient
+        const grad = new THREE.Vector3();
+        const xVec = currentVec.clone();
+        xVec.x += epsilon;
+        const xDist = calculateTrajectory(xVec).distanceSq;
+        grad.x = (xDist - currentDist) / epsilon;
+
+        const yVec = currentVec.clone();
+        yVec.y += epsilon;
+        const yDist = calculateTrajectory(yVec).distanceSq;
+        grad.y = (yDist - currentDist) / epsilon;
+
+        const zVec = currentVec.clone();
+        zVec.z += epsilon;
+        const zDist = calculateTrajectory(zVec).distanceSq;
+        grad.z = (zDist - currentDist) / epsilon;
+
+        // Update vector
+        currentVec.sub(grad.multiplyScalar(learningRate)).normalize();
+
+        autoAimState.iterations++;
+        requestAnimationFrame(searchStep);
+      }
+      searchStep();
+    };
+    const autoAimInfo = document.createElement('div');
+    autoAimInfo.style.marginTop = '4px';
+    autoAimInfo.style.color = '#66ccff';
+    autoAimInfo.textContent = 'Select a target and click Auto-Aim.';
+
+    autoAimRow.appendChild(autoAimLabel);
+    autoAimRow.appendChild(autoAimSelect);
+    autoAimRow.appendChild(autoAimBtn);
+    const autoAimCancelBtn = document.createElement('button');
+    autoAimCancelBtn.textContent = 'Cancel';
+    autoAimCancelBtn.style.display = 'none';
+    autoAimCancelBtn.onclick = () => {
+      autoAimState.running = false;
+    };
+    autoAimRow.appendChild(autoAimCancelBtn);
+    autoAimForm.appendChild(autoAimRow);
+    autoAimForm.appendChild(autoAimInfo);
+
     // Time slider
     const speedWrap = document.createElement('div');
     const speedLabel = document.createElement('span'); speedLabel.textContent = 'Scale:';
@@ -1181,6 +1354,7 @@
     const btnAimPick = document.createElement('button'); btnAimPick.textContent = 'Aim: Pick on sphere';
     aimRow3.appendChild(btnSnapProg); aimRow3.appendChild(btnSnapRad); aimRow3.appendChild(btnSnapNorm); aimRow3.appendChild(btnAimPick);
     aimForm.appendChild(aimRow2); aimForm.appendChild(aimRow3);
+        panelLaunch.appendChild(autoAimForm);
     panelLaunch.appendChild(aimForm);
 
     // -------- Aim Ball (2D UI sphere to pick 3D direction) --------
@@ -1438,7 +1612,7 @@
       const d = dir.clone(); if (d.lengthSq() < 1e-12) d.set(1,0,0); d.normalize();
       payloadState.vecX = d.x; payloadState.vecY = d.y; payloadState.vecZ = d.z; preview.dirty = true;
       // reflect in inputs
-      try { vecX.value = String(payloadState.vecX.toFixed(3)); vecY.value = String(payloadState.vecY.toFixed(3)); vecZ.value = String(payloadState.vecZ.toFixed(3)); } catch {}
+      try { vecX.value = String(payloadState.vecX.toFixed(6)); vecY.value = String(payloadState.vecY.toFixed(6)); vecZ.value = String(payloadState.vecZ.toFixed(6)); } catch {}
       drawAimBall();
     }
     function onPointerDownAim(e) {
@@ -1665,6 +1839,7 @@
       if (key === 'f' || key === 'F') { btnFollow.click(); return; }
       if (key === 'r' || key === 'R') { btnResetView.click(); return; }
       if (key === 'p' || key === 'P') { btnSpin.click(); return; }
+      if (key === 'x' || key === 'X') { tars.spin += 20; return; }
       const DV_KEY = DV;
       if (key === 'ArrowUp') { e.preventDefault(); const { prograde } = getOrthoBasis(); tryApplyDv(prograde, DV_KEY); return; }
       if (key === 'ArrowDown') { e.preventDefault(); const { prograde } = getOrthoBasis(); tryApplyDv(prograde.multiplyScalar(-1), DV_KEY); return; }
