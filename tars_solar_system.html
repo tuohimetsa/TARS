@@ -63,9 +63,12 @@
       // New TARS physics
       sailArea: 5000, // m^2 (of one sail, so 2*sailArea total)
       sailLeverArm: 50, // meters (distance from center of mass to center of pressure of one sail)
-      momentOfInertia: 1e8, // kg*m^2
       sailReflectivityWhite: 0.9,
       sailReflectivityBlack: 0.1,
+      payloadMass: 1000, // kg
+      tensileStrengthPa: 1000000, // Pa
+      tetherCrossSectionalArea: 0.01, // m^2
+      tetherMass: 100, // kg
     };
     // Trail sampling (to reduce jitter at low time scales)
     const trailSampling = {
@@ -197,8 +200,8 @@
       showStarfield: true,
       showLabels: true,
       showTrails: true,
-      showGravityWells: true, // New state for gravity wells
-      previewBrightness: 0.5,
+
+      previewBrightness: 0.7,
       timeScaleMultiplier: 100, // 100x realtime by default
       timeScaleYearsPerSec: 100 * REALTIME_YEARS_PER_SEC,
       focus: 'TARS'
@@ -232,9 +235,13 @@
     ghostPlanet.visible = false;
     scene.add(ghostPlanet);
 
+    // Gravity well visualization
+    const gravityWells = [];
+    state.showGravityWells = true;
+
     // Orbit guide helper (circles)
     const orbitGuides = [];
-    const gravityWells = []; // New array for gravity wells
+
     function addOrbitGuide(radiusAU, color = 0xffffff, opacity = 0.07) {
       const segments = 512;
       const geometry = new THREE.BufferGeometry();
@@ -252,22 +259,7 @@
       return line;
     }
 
-    function addGravityWell(radiusAU, color = 0xffffff, opacity = 0.15) {
-      const segments = 128;
-      const geometry = new THREE.BufferGeometry();
-      const positions = new Float32Array(segments * 3);
-      for (let i = 0; i < segments; i++) {
-        const a = (i / segments) * Math.PI * 2;
-        positions[3*i+0] = Math.cos(a) * radiusAU * SCALE;
-        positions[3*i+1] = 0;
-        positions[3*i+2] = Math.sin(a) * radiusAU * SCALE;
-      }
-      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-      const material = new THREE.LineBasicMaterial({ color, transparent: true, opacity });
-      const line = new THREE.LineLoop(geometry, material);
-      gravityWells.push(line); // Add to the array
-      return line;
-    }
+
 
     // Approx planet mass ratios (Mplanet / MSun)
     const planetMassRatio = {
@@ -301,8 +293,13 @@
       const massRatio = planetMassRatio[p.name] || 0;
       const hillRadiusAU = p.a * Math.pow(massRatio / 3, 1/3);
       body.hillRadiusAU = hillRadiusAU; // Storing for preview intersection
-      const well = addGravityWell(hillRadiusAU, p.color, 0.15);
-      body.mesh.add(well); // Add well to the planet's mesh
+
+      const wellGeom = new THREE.SphereGeometry(hillRadiusAU * SCALE, 32, 16);
+      const wellMat = new THREE.MeshBasicMaterial({ color: p.color, transparent: true, opacity: 0.05, wireframe: true });
+      const well = new THREE.Mesh(wellGeom, wellMat);
+      well.visible = state.showGravityWells;
+      body.mesh.add(well);
+      gravityWells.push(well);
 
       return body;
     });
@@ -538,6 +535,18 @@
         scene.remove(p.trail.line);
         p.mesh.geometry.dispose(); p.mesh.material.dispose();
         simObjects.payloads.splice(pIdx, 1);
+
+        delete nameToBody[id];
+        const opt = focusSelect.querySelector(`option[value="${id}"]`);
+        if (opt) {
+          focusSelect.removeChild(opt);
+        }
+        if (state.focus === id) {
+          state.focus = 'TARS';
+          focusSelect.value = 'TARS';
+          frameFocus(true);
+        }
+
         return true;
       }
       const mIdx = simObjects.markers.findIndex(o => o.id === id);
@@ -813,8 +822,8 @@
         // coloring
         const speed = v.length();
         const color = new THREE.Color();
-        const t = Math.min(1, speed / 1.0); // Normalize speed to [0, 1] for color
-        color.setHSL(0.7 * (1 - t), 1.0, state.previewBrightness);
+        const t = Math.min(1, speed / 1.5); // Normalize speed to [0, 1] for color, adjusted for better range
+        color.setHSL(t * 0.33, 1.0, Math.max(0.3, state.previewBrightness));
         colors[i*3+0] = color.r;
         colors[i*3+1] = color.g;
         colors[i*3+2] = color.b;
@@ -894,9 +903,9 @@
                   ghostPlanet.geometry = planet.mesh.geometry.clone();
                   ghostPlanet.material.color.set(planet.color);
                   ghostPlanet.position.set(
-                      overallClosest.planetPos.x * SCALE,
-                      overallClosest.planetPos.y * SCALE,
-                      overallClosest.planetPos.z * SCALE
+                      overallClosest.planetPos.x * SCALE - renderOrigin.x,
+                      overallClosest.planetPos.y * SCALE - renderOrigin.y,
+                      overallClosest.planetPos.z * SCALE - renderOrigin.z
                   );
                   ghostPlanet.scale.copy(planet.mesh.scale);
                   ghostPlanet.visible = true;
@@ -930,7 +939,8 @@
       
       const torque = (force_white - force_black) * physics.sailLeverArm; // N*m
       
-      const angular_acceleration = torque / physics.momentOfInertia; // rad/s^2
+      const momentOfInertia = (physics.payloadMass + physics.payloadMass + physics.tetherMass) * physics.sailLeverArm * physics.sailLeverArm;
+      const angular_acceleration = torque / momentOfInertia; // rad/s^2
       
       const dtSeconds = dtYears * YEAR_SECONDS;
       tars.spin += angular_acceleration * dtSeconds;
@@ -939,10 +949,19 @@
       tars.spin = Math.max(0, tars.spin - physics.spinDecay * dtYears);
 
       const gForce = (tars.spin * tars.spin * physics.sailLeverArm) / 9.8;
-      if (gForce > physics.maxGForce) {
-        flashHudMessage('TARS structural failure due to excessive G-force!');
-        resetTars();
+      const tensileForce = physics.payloadMass * gForce * 9.8;
+      const tensilePressure = tensileForce / physics.tetherCrossSectionalArea;
+      if (tensilePressure > physics.tensileStrengthPa) {
+        handleStructuralFailure();
       }
+
+    }
+
+    function handleStructuralFailure() {
+      flashHudMessage('TARS structural failure due to excessive tensile pressure!');
+      tars.spin = 0;
+      const randomDirection = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
+      releasePayloadNow(randomDirection);
     }
 
     // Initialize TARS orbital velocity for near-circular orbit at its radius
@@ -981,10 +1000,10 @@
       const simDate = new Date(simMillis);
       const tipScale = (typeof payloadState !== 'undefined' && payloadState && Number.isFinite(payloadState.tipScaleMSPerRad)) ? payloadState.tipScaleMSPerRad : 10;
       const tipSpeedMps = Math.max(0, tars.spin) * tipScale;
+      console.log('tipScale:', tipScale, 'tipSpeedMps:', tipSpeedMps);
       const gForce = (tars.spin * tars.spin * physics.sailLeverArm) / 9.8;
       const potential_v_mps = physics.sailLeverArm * tars.spin;
-      hudStats.textContent =
-        `Real time: ${realNow.toLocaleString()}
+      hudStats.textContent = `Real time: ${realNow.toLocaleString()}
 ` +
         `Sim time: ${simDate.toLocaleString()} (Δ ${state.simYears.toFixed(2)} years)
 ` +
@@ -993,10 +1012,16 @@
         `Exit velocity (last): ${tars.lastExitVelocityMps.toFixed(2)} m/s
 ` +
         `Potential exit velocity: ${(potential_v_mps/1000).toFixed(2)} km/s
-` +        `Tip speed: ${tipSpeedMps.toFixed(1)} m/s
-` +        `G-force: ${gForce.toFixed(2)} G
 ` +
-        `Spin: ${tars.spin.toFixed(3)} rad/s
+        `Tip speed: ${tipSpeedMps.toFixed(1)} m/s
+` +
+        `G-force: ${gForce.toFixed(2)} G
+` +
+        `Tensile Force (${physics.payloadMass}kg payload): ${(physics.payloadMass * gForce * 9.8).toLocaleString()} N
+` +
+        `Tensile Pressure: ${(physics.payloadMass * gForce * 9.8 / physics.tetherCrossSectionalArea).toLocaleString()} Pa
+` +
+        `Spin: ${tars.spin.toFixed(3)} rad/s (${(tars.spin * 60 / (2 * Math.PI)).toFixed(2)} RPM)
 ` +
         `Time scale: ${state.timeScaleMultiplier.toLocaleString()}x realtime (${state.timeScaleYearsPerSec.toExponential(3)} y/s)
 ` +
@@ -1034,7 +1059,7 @@
     const btnStars = document.createElement('button'); btnStars.textContent = 'Toggle Stars';
     const btnLabels = document.createElement('button'); btnLabels.textContent = 'Toggle Labels';
     const btnTrails = document.createElement('button'); btnTrails.textContent = 'Toggle Trails';
-    const btnWells = document.createElement('button'); btnWells.textContent = 'Toggle Wells'; // New button
+    const btnWells = document.createElement('button'); btnWells.textContent = 'Toggle Wells';
     const btnResetView = document.createElement('button'); btnResetView.textContent = 'Reset View';
 
     const autoAimForm = document.createElement('div'); autoAimForm.className = 'btnbar';
@@ -1060,9 +1085,11 @@
       autoAimCancelBtn.style.display = 'inline-block';
       autoAimInfo.textContent = `Searching for trajectory to ${autoAimState.targetPlanetName}...`;
 
-      const learningRate = 0.1;
+      const learningRate = 0.01; // Reduced learning rate for stability with momentum
       const epsilon = 1e-6;
+      const momentum = 0.9;
       let currentVec = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ).normalize();
+      let velocity = new THREE.Vector3();
 
       function searchStep() {
         if (!autoAimState.running || autoAimState.iterations >= autoAimState.maxIterations) {
@@ -1107,8 +1134,11 @@
         const zDist = calculateTrajectory(zVec).distanceSq;
         grad.z = (zDist - currentDist) / epsilon;
 
+        // Update velocity with momentum
+        velocity.multiplyScalar(momentum).add(grad.multiplyScalar(-learningRate));
+
         // Update vector
-        currentVec.sub(grad.multiplyScalar(learningRate)).normalize();
+        currentVec.add(velocity).normalize();
 
         autoAimState.iterations++;
         requestAnimationFrame(searchStep);
@@ -1194,10 +1224,14 @@
     physForm.appendChild(makeField('muSun (AU^3/yr^2)', 'muSun', 0.001, 0.0001));
     physForm.appendChild(makeField('maxDt (yr)', 'maxDt', 0.0001, 0.00001));
     physForm.appendChild(makeField('spinDecay', 'spinDecay', 0.001, 0));
-    physForm.appendChild(makeField('Max G-force', 'maxGForce', 1, 1));
+
     physForm.appendChild(makeField('Sail Area (m^2)', 'sailArea', 100, 0));
     physForm.appendChild(makeField('Sail Lever Arm (m)', 'sailLeverArm', 1, 0));
-    physForm.appendChild(makeField('Moment of Inertia (kg*m^2)', 'momentOfInertia', 1e7, 0));
+
+    physForm.appendChild(makeField('Payload Mass (kg)', 'payloadMass', 100, 0));
+    physForm.appendChild(makeField('Tensile Strength (Pa)', 'tensileStrengthPa', 100000, 0));
+    physForm.appendChild(makeField('Tether Cross-sectional Area (m^2)', 'tetherCrossSectionalArea', 0.001, 0));
+    physForm.appendChild(makeField('Tether Mass (kg)', 'tetherMass', 10, 0));
     physForm.appendChild(makeField('Reflectivity (White Sail)', 'sailReflectivityWhite', 0.01, 0, 1));
     physForm.appendChild(makeField('Reflectivity (Black Sail)', 'sailReflectivityBlack', 0.01, 0, 1));
     // N-body toggle
@@ -1230,8 +1264,7 @@
     // Orbit guide opacity
     const initialOrbitOpacity = (orbitGuides[0] && orbitGuides[0].material && orbitGuides[0].material.opacity) || 0.06;
     gfxForm.appendChild(makeGfxSlider('Orbit opacity', 0, 1, 0.02, initialOrbitOpacity, (v)=>{ for (const l of orbitGuides) { if (l.material && l.material.transparent) l.material.opacity = v; } for (const w of gravityWells) { if (w.material && w.material.transparent) w.material.opacity = v; } }));
-    // Preview brightness
-    gfxForm.appendChild(makeGfxSlider('Preview brightness', 0, 1, 0.05, state.previewBrightness, (v)=>{ state.previewBrightness = v; preview.dirty = true; }));
+
     // Background color
     const bgRow = document.createElement('div'); bgRow.className='row';
     const bgLbl = document.createElement('label'); bgLbl.textContent = 'Background';
@@ -1292,7 +1325,7 @@
     // ---------- Launch Payload panel (combined) ----------
     const payloadForm = document.createElement('div'); payloadForm.className = 'btnbar';
     const payloadState = {
-      
+      tipScaleMSPerRad: 10, // m/s per rad/s
       dvMag: 100,       // m/s
       vecX: 1, vecY: 0, vecZ: 0 // vector components in world frame (normalized when used)
     };
@@ -1706,14 +1739,17 @@
       return prograde.clone().applyAxisAngle(up, tars.spinPhase).normalize();
     }
 
-    function releasePayloadNow() {
+    function releasePayloadNow(direction) {
       // Ejection direction and magnitude determine payload exit velocity relative to TARS.
       const r = physics.sailLeverArm; // Use sailLeverArm as the release radius
       const w = tars.spin;
       const v_mps = r * w;
       let dvAUPerYr = mpsToAUPerYr(v_mps);
 
-      let dir = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ);
+      let dir = direction;
+      if (!dir) {
+        dir = new THREE.Vector3(payloadState.vecX, payloadState.vecY, payloadState.vecZ);
+      }
       if (dir.lengthSq() < 1e-12) dir.set(1,0,0);
       dir.normalize();
       // Track the single Δv quantity: payload exit speed in m/s
@@ -1723,9 +1759,29 @@
         velocity: tars.velocity.clone().add(new THREE.Vector3().copy(dir).multiplyScalar(dvAUPerYr)),
         color: 0x66ff88
       };
-      spawnPayload(init);
+      const payloadId = spawnPayload(init);
+      const payload = simObjects.payloads.find(p => p.id === payloadId);
+      if (payload) {
+        nameToBody[payload.id] = payload.mesh;
+        const opt = document.createElement('option');
+        opt.value = payload.id;
+        opt.textContent = payload.id;
+        focusSelect.appendChild(opt);
+        focusSelect.value = payload.id;
+        state.focus = payload.id;
+        state.followTARS = true;
+        const focusObj = nameToBody[state.focus];
+        if (state.followTARS && focusObj) {
+          const targetPosition = new THREE.Vector3();
+          focusObj.getWorldPosition(targetPosition);
+          state.prevFollowTarget = targetPosition.clone();
+          // Also move the camera to an initial position relative to the payload
+          const offset = new THREE.Vector3(0, 10, 20); // 10km up, 20km back
+          camera.position.copy(targetPosition).add(offset);
+        }
+      }
     }
-    btnLaunch.onclick = releasePayloadNow;
+    btnLaunch.onclick = () => releasePayloadNow();
     btnClear.onclick = ()=>{
       [...simObjects.payloads.map(p=>p.id)].forEach(despawnById);
     };
@@ -1767,8 +1823,11 @@
       state.followTARS = !state.followTARS;
       const focusObj = nameToBody[state.focus];
       if (state.followTARS && focusObj) {
-        state.followOffset = camera.position.clone().sub(focusObj.position);
-        state.prevFollowTarget = focusObj.position.clone();
+        const targetPosition = new THREE.Vector3();
+        focusObj.getWorldPosition(targetPosition);
+        state.prevFollowTarget = targetPosition.clone();
+      } else {
+        state.prevFollowTarget = null;
       }
     };
     btnFaster.onclick = () => { setMultiplier(state.timeScaleMultiplier * 1.6); };
@@ -1832,6 +1891,7 @@
       if (key === 'r' || key === 'R') { btnResetView.click(); return; }
       if (key === 'p' || key === 'P') { btnSpin.click(); return; }
       if (key === 'x' || key === 'X') { tars.spin += 20; return; }
+      if (key === 'z' || key === 'Z') { tars.spin -= 20; return; }
       const DV_KEY = DV;
       if (key === 'ArrowUp') { e.preventDefault(); const { prograde } = getOrthoBasis(); tryApplyDv(prograde, DV_KEY); return; }
       if (key === 'ArrowDown') { e.preventDefault(); const { prograde } = getOrthoBasis(); tryApplyDv(prograde.multiplyScalar(-1), DV_KEY); return; }
@@ -1981,6 +2041,13 @@
         }
       }
       for (const p of planets) p.updateVisual();
+      for (const p of simObjects.payloads) {
+        p.mesh.position.set(
+          p.position.x * SCALE - renderOrigin.x,
+          p.position.y * SCALE - renderOrigin.y,
+          p.position.z * SCALE - renderOrigin.z
+        );
+      }
       // Align static visuals to render origin
       starfield.position.set(-renderOrigin.x, -renderOrigin.y, -renderOrigin.z);
       for (const g of orbitGuides) g.position.set(-renderOrigin.x, -renderOrigin.y, -renderOrigin.z);
@@ -2049,18 +2116,21 @@
       }
       sun.rotation.y += 0.02; // slow spin for visual interest
 
-      // Optional camera follow with zoom/orbit preserved
-      const focusObj = nameToBody[state.focus];
-      if (state.followTARS && focusObj) {
-        if (!state.prevFollowTarget) {
-          state.prevFollowTarget = focusObj.position.clone();
+      if (state.followTARS && state.focus) {
+        const focusObj = nameToBody[state.focus];
+        if (focusObj) {
+          const targetPosition = new THREE.Vector3();
+          // The position of the mesh is already in render units, so we use it directly
+          focusObj.getWorldPosition(targetPosition);
+
+          if (state.prevFollowTarget) {
+            const delta = targetPosition.clone().sub(state.prevFollowTarget);
+            camera.position.add(delta);
+          }
+          controls.target.copy(targetPosition);
+          state.prevFollowTarget = targetPosition.clone();
         }
-        const delta = new THREE.Vector3().copy(focusObj.position).sub(state.prevFollowTarget);
-        controls.target.add(delta);
-        camera.position.add(delta);
-        state.prevFollowTarget.copy(focusObj.position);
       }
-      reanchoredThisFrame = false;
 
       // Apply orientation and spin once per frame
       {
@@ -2082,7 +2152,8 @@
         if (sn) { sn.rotation.y = tars.spinPhase; }
       }
 
-      controls.update();
+      // Update controls
+      controls.update(realDtSeconds);
 
       for (const label of allLabels) {
         const distance = camera.position.distanceTo(label.getWorldPosition(new THREE.Vector3()));
@@ -2115,6 +2186,7 @@
         }
       }
       updateHUD();
+      // Render the scene
       renderer.render(scene, camera);
     }
     animate();
