@@ -605,8 +605,11 @@
       // Initialize anchor at first point
       if (!trail.anchorInitialized) {
         trail.anchor.copy(v3WorldKm);
-        trail.line.position.copy(trail.anchor);
-        if (trail.headLine) trail.headLine.position.copy(trail.anchor);
+        {
+          const localAnchor = trail.anchor.clone().sub(renderOrigin);
+          trail.line.position.copy(localAnchor);
+          if (trail.headLine) trail.headLine.position.copy(localAnchor);
+        }
         trail.anchorInitialized = true;
       }
       // Re-anchor if distance from anchor grows too large
@@ -614,8 +617,11 @@
       if (offset.length() > (trail.reanchorDistanceKm || 5e7)) {
         const delta = new THREE.Vector3().copy(v3WorldKm).sub(trail.anchor);
         trail.anchor.copy(v3WorldKm);
-        trail.line.position.copy(trail.anchor);
-        if (trail.headLine) trail.headLine.position.copy(trail.anchor);
+        {
+          const localAnchor = trail.anchor.clone().sub(renderOrigin);
+          trail.line.position.copy(localAnchor);
+          if (trail.headLine) trail.headLine.position.copy(localAnchor);
+        }
         // Shift existing vertices by -delta to keep them near origin
         for (let i = 0; i < trail.count; i++) {
           const j = i * 3;
@@ -701,6 +707,40 @@
     scene.add(preview.payload.line);
     preview.payload.line.visible = false;
 
+    function calculateAllPlanetAccels(planetStates) {
+        const accels = planetStates.map(() => new THREE.Vector3());
+        const rVec = new THREE.Vector3(); // reuse this vector
+
+        // Sun gravity
+        for (let i = 0; i < planetStates.length; i++) {
+            accels[i].copy(sunAccelAUPerYr2(planetStates[i].pos));
+        }
+
+        if (!physics.nBodyAttractors) return accels;
+
+        // Planet-planet gravity
+        for (let i = 0; i < planetStates.length; i++) {
+            for (let j = i + 1; j < planetStates.length; j++) {
+                const body1 = planetStates[i];
+                const body2 = planetStates[j];
+                const m1_ratio = planetMassRatio[body1.name];
+                const m2_ratio = planetMassRatio[body2.name];
+                if (!m1_ratio || !m2_ratio) continue;
+
+                rVec.subVectors(body1.pos, body2.pos);
+                const r2 = rVec.lengthSq();
+                const r = Math.sqrt(r2) + 1e-12;
+                const r3_inv = 1 / (r*r*r);
+
+                // acc on body1 from body2
+                accels[i].addScaledVector(rVec, -physics.muSun * m2_ratio * r3_inv);
+                // acc on body2 from body1
+                accels[j].addScaledVector(rVec, physics.muSun * m1_ratio * r3_inv);
+            }
+        }
+        return accels;
+    }
+
     function calculateTrajectory(launchVec) {
       const steps = Math.max(2, Math.min(preview.steps, preview.payload.maxPoints));
       const dt = preview.horizonYears / (steps - 1);
@@ -753,11 +793,21 @@
         p.addScaledVector(v, dt);
         const a1 = localAccel(p.clone());
         v.addScaledVector(a1, dt * 0.5);
-        for (const st of planetStates) {
-          const a0p = sunAccelAUPerYr2(st.pos.clone());
+        
+        const planetAccels = calculateAllPlanetAccels(planetStates);
+
+        for (let j = 0; j < planetStates.length; j++) {
+          const st = planetStates[j];
+          const a0p = planetAccels[j];
           st.vel.addScaledVector(a0p, dt * 0.5);
           st.pos.addScaledVector(st.vel, dt);
-          const a1p = sunAccelAUPerYr2(st.pos.clone());
+        }
+
+        const newPlanetAccels = calculateAllPlanetAccels(planetStates);
+
+        for (let j = 0; j < planetStates.length; j++) {
+          const st = planetStates[j];
+          const a1p = newPlanetAccels[j];
           st.vel.addScaledVector(a1p, dt * 0.5);
         }
       }
@@ -768,7 +818,7 @@
       hitMarker.visible = false;
       closestApproachLine.visible = false;
       ghostPlanet.visible = false;
-      document.getElementById('preview-info').textContent = '';
+      if (!preview.enabled) document.getElementById('preview-info').textContent = '';
 
       const positions = preview.payload.positions;
       const colors = preview.payload.colors;
@@ -792,6 +842,7 @@
         payloadVel: null,
         planetPos: null,
         planetVel: null,
+        step: -1,
       }));
 
       function localAccel(posAU) {
@@ -813,6 +864,9 @@
       let hitStep = -1;
       let hitPlanetName = '';
 
+      let p_old = p.clone();
+      let planetStates_old = planetStates.map(st => ({...st, pos: st.pos.clone(), vel: st.vel.clone()}));
+
       for (let i = 0; i < steps; i++) {
         // write world positions in render units
         positions[i*3+0] = p.x * SCALE;
@@ -828,6 +882,31 @@
         colors[i*3+1] = color.g;
         colors[i*3+2] = color.b;
 
+        p_old.copy(p);
+        planetStates_old = planetStates.map(st => ({...st, pos: st.pos.clone(), vel: st.vel.clone()}));
+
+        // advance one step with velocity-Verlet using local N-body accel
+        const a0 = localAccel(p.clone());
+        v.addScaledVector(a0, dt * 0.5);
+        p.addScaledVector(v, dt);
+        const a1 = localAccel(p.clone());
+        v.addScaledVector(a1, dt * 0.5);
+        
+        // advance planet states with N-body gravity
+        const planetAccels = calculateAllPlanetAccels(planetStates);
+        for (let j = 0; j < planetStates.length; j++) {
+          const st = planetStates[j];
+          const a0p = planetAccels[j];
+          st.vel.addScaledVector(a0p, dt * 0.5);
+          st.pos.addScaledVector(st.vel, dt);
+        }
+        const newPlanetAccels = calculateAllPlanetAccels(planetStates);
+        for (let j = 0; j < planetStates.length; j++) {
+          const st = planetStates[j];
+          const a1p = newPlanetAccels[j];
+          st.vel.addScaledVector(a1p, dt * 0.5);
+        }
+
         // Check for intersection and closest approach
         for (let j = 0; j < planetStates.length; j++) {
             const st = planetStates[j];
@@ -838,33 +917,36 @@
                 closestApproaches[j].payloadVel = v.clone();
                 closestApproaches[j].planetPos = st.pos.clone();
                 closestApproaches[j].planetVel = st.vel.clone();
+                closestApproaches[j].step = i;
             }
             const planetRadiusAU = (planetRadiusKm[st.name] || 0) / KM_PER_AU;
             if (hitStep === -1 && planetRadiusAU > 0 && distanceSq < planetRadiusAU * planetRadiusAU) {
-                hitStep = i;
+                // Refine impact
+                let low = 0.0, high = 1.0;
+                let impactT = 1.0;
+                for(let k=0; k<5; k++) {
+                    const mid = (low + high) / 2;
+                    const p_interp = p_old.clone().lerp(p, mid);
+                    const planet_pos_interp = planetStates_old[j].pos.clone().lerp(st.pos, mid);
+                    if (p_interp.distanceToSquared(planet_pos_interp) < planetRadiusAU * planetRadiusAU) {
+                        high = mid;
+                    } else {
+                        low = mid;
+                    }
+                }
+                impactT = high;
+
+                hitStep = i - 1 + impactT;
                 hitPlanetName = st.name;
-                hitMarker.position.set(p.x * SCALE, p.y * SCALE, p.z * SCALE);
+                const p_impact = p_old.clone().lerp(p, impactT);
+                hitMarker.position.set(p_impact.x * SCALE, p_impact.y * SCALE, p_impact.z * SCALE);
                 hitMarker.visible = true;
+                p.copy(p_impact); // Stop payload at impact point
             }
         }
 
         if (hitStep !== -1) {
           break;
-        }
-
-        // advance one step with velocity-Verlet using local N-body accel
-        const a0 = localAccel(p.clone());
-        v.addScaledVector(a0, dt * 0.5);
-        p.addScaledVector(v, dt);
-        const a1 = localAccel(p.clone());
-        v.addScaledVector(a1, dt * 0.5);
-        // advance planet states with Sun gravity only
-        for (const st of planetStates) {
-          const a0p = sunAccelAUPerYr2(st.pos.clone());
-          st.vel.addScaledVector(a0p, dt * 0.5);
-          st.pos.addScaledVector(st.vel, dt);
-          const a1p = sunAccelAUPerYr2(st.pos.clone());
-          st.vel.addScaledVector(a1p, dt * 0.5);
         }
       }
       preview.payload.geometry.attributes.position.needsUpdate = true;
@@ -878,7 +960,20 @@
           const hitApproach = closestApproaches.find(a => a.planetName === hitPlanetName);
           const relVel = new THREE.Vector3().subVectors(hitApproach.payloadVel, hitApproach.planetVel);
           const relSpeedMps = auPerYrToMps(relVel.length());
-          previewInfo.textContent = `Impact: ${hitPlanetName} at ${relSpeedMps.toFixed(0)} m/s`;
+          const days = hitStep * dt * 365.25;
+          // Also compute closest approach timing for display
+          let overallClosest = { distanceSq: Infinity };
+          for (const approach of closestApproaches) {
+              if (approach.distanceSq < overallClosest.distanceSq) {
+                  overallClosest = approach;
+              }
+          }
+          let closestPart = '';
+          if (overallClosest && overallClosest.step != null && overallClosest.step >= 0) {
+            const caDays = overallClosest.step * dt * 365.25;
+            closestPart = ` • Closest approach: ${overallClosest.planetName} at ${caDays.toFixed(1)} days`;
+          }
+          if (!preview.enabled) previewInfo.textContent = `Impact: ${hitPlanetName} at ${relSpeedMps.toFixed(0)} m/s ${days.toFixed(1)} days${closestPart}`;
       } else {
           let overallClosest = { distanceSq: Infinity };
           for (const approach of closestApproaches) {
@@ -896,7 +991,7 @@
               line_positions[5] = overallClosest.planetPos.z * SCALE;
               closestApproachLine.geometry.setAttribute('position', new THREE.BufferAttribute(line_positions, 3));
               closestApproachLine.geometry.computeBoundingSphere();
-              closestApproachLine.visible = true;
+              if (preview.enabled) closestApproachLine.visible = true;
 
               const planet = planets.find(p => p.name === overallClosest.planetName);
               if (planet) {
@@ -908,13 +1003,18 @@
                       overallClosest.planetPos.z * SCALE - renderOrigin.z
                   );
                   ghostPlanet.scale.copy(planet.mesh.scale);
-                  ghostPlanet.visible = true;
+                  if (preview.enabled) ghostPlanet.visible = true;
               }
 
               const relVel = new THREE.Vector3().subVectors(overallClosest.payloadVel, overallClosest.planetVel);
               const relSpeedMps = auPerYrToMps(relVel.length());
               const distKm = Math.sqrt(overallClosest.distanceSq) * SCALE;
-              previewInfo.textContent = `Closest approach: ${overallClosest.planetName} (${distKm.toExponential(2)} km at ${relSpeedMps.toFixed(0)} m/s)`;
+              const days = (overallClosest.step !== undefined && overallClosest.step >= 0) ? (overallClosest.step * dt * 365.25) : -1;
+              if (days >= 0) {
+                previewInfo.textContent = `Closest approach: ${overallClosest.planetName} in ${days.toFixed(1)} days (${distKm.toExponential(2)} km at ${relSpeedMps.toFixed(0)} m/s)`;
+              } else {
+                previewInfo.textContent = `Closest approach: ${overallClosest.planetName} (${distKm.toExponential(2)} km at ${relSpeedMps.toFixed(0)} m/s)`;
+              }
           }
       }
 
@@ -1229,7 +1329,24 @@
     physForm.appendChild(makeField('Sail Lever Arm (m)', 'sailLeverArm', 1, 0));
 
     physForm.appendChild(makeField('Payload Mass (kg)', 'payloadMass', 100, 0));
-    physForm.appendChild(makeField('Tensile Strength (Pa)', 'tensileStrengthPa', 100000, 0));
+    {
+      const row = document.createElement('div'); row.className = 'row';
+      const lbl = document.createElement('label'); lbl.textContent = 'Tensile Strength (GPa)';
+      const input = document.createElement('input'); input.type = 'number';
+      input.step = '0.1';
+      input.min = '0';
+      input.value = String(physics.tensileStrengthPa / 1e9);
+      input.style.width = '120px';
+      input.onchange = () => {
+        const gpa = parseFloat(input.value);
+        if (Number.isFinite(gpa)) {
+          physics.tensileStrengthPa = gpa * 1e9;
+        }
+      };
+      row.appendChild(lbl);
+      row.appendChild(input);
+      physForm.appendChild(row);
+    }
     physForm.appendChild(makeField('Tether Cross-sectional Area (m^2)', 'tetherCrossSectionalArea', 0.001, 0));
     physForm.appendChild(makeField('Tether Mass (kg)', 'tetherMass', 10, 0));
     physForm.appendChild(makeField('Reflectivity (White Sail)', 'sailReflectivityWhite', 0.01, 0, 1));
@@ -2040,6 +2157,19 @@
           reanchoredThisFrame = true;
         }
       }
+      // Ensure trail anchors are expressed in render-local coordinates each frame
+      if (tarsTrail) {
+        const localAnchor = tarsTrail.anchor.clone().sub(renderOrigin);
+        tarsTrail.line.position.copy(localAnchor);
+        if (tarsTrail.headLine) tarsTrail.headLine.position.copy(localAnchor);
+      }
+      for (const pl of simObjects.payloads) {
+        if (pl.trail) {
+          const localAnchor = pl.trail.anchor.clone().sub(renderOrigin);
+          pl.trail.line.position.copy(localAnchor);
+          if (pl.trail.headLine) pl.trail.headLine.position.copy(localAnchor);
+        }
+      }
       for (const p of planets) p.updateVisual();
       for (const p of simObjects.payloads) {
         p.mesh.position.set(
@@ -2175,15 +2305,16 @@
         }
         drawAimBall();
       }
-      // Lazy-update preview
+      // Lazy-update preview visuals; compute HUD even if preview is off
+      if (preview._accum == null) preview._accum = 0;
+      preview._accum += realDtSeconds;
+      if (preview.dirty || preview._accum > 0.2) {
+        computePayloadPreview();
+        preview._accum = 0;
+      }
       if (preview.enabled) {
         // Recompute only when marked dirty or every ~0.2s of real time
-        if (preview._accum == null) preview._accum = 0;
-        preview._accum += realDtSeconds;
-        if (preview.dirty || preview._accum > 0.2) {
-          computePayloadPreview();
-          preview._accum = 0;
-        }
+        // visuals are shown by computePayloadPreview when enabled
       }
       updateHUD();
       // Render the scene
