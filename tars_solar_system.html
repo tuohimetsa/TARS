@@ -1557,14 +1557,14 @@
       asteroidMass: 100000, // kg
       asteroidRadius: 50, // m
       interceptVelocity: 10000, // m/s
-      impactPulse: 0
+      impulse: 0
     };
 
-    function calculateImpactPulse() {
-      targetsState.impactPulse = targetsState.asteroidMass * targetsState.interceptVelocity;
-      const impactPulseDisplay = document.getElementById('impact-pulse-display');
-      if (impactPulseDisplay) {
-        impactPulseDisplay.textContent = `Impact Pulse: ${targetsState.impactPulse.toExponential(2)} Ns`;
+    function calculateimpulse() {
+      targetsState.impulse = targetsState.asteroidMass * targetsState.interceptVelocity;
+      const impulseDisplay = document.getElementById('impact-pulse-display');
+      if (impulseDisplay) {
+        impulseDisplay.textContent = `Impact Pulse: ${targetsState.impulse.toExponential(2)} Ns`;
       }
     }
 
@@ -1626,7 +1626,7 @@
         asteroid.trail.headLine.visible = state.showTrails;
       }
       simObjects.asteroids.push(asteroid);
-      calculateImpactPulse();
+      calculateimpulse();
       return id;
     }
     
@@ -1655,7 +1655,7 @@
         const v = parseFloat(input.value);
         if (!Number.isFinite(v)) return;
         targetsState[key] = v;
-        calculateImpactPulse();
+        calculateimpulse();
       };
       row.appendChild(lbl);
       row.appendChild(input);
@@ -1671,14 +1671,14 @@
     spawnBtn.onclick = spawnAsteroid;
     targetsForm.appendChild(spawnBtn);
 
-    const impactPulseDisplay = document.createElement('div');
-    impactPulseDisplay.id = 'impact-pulse-display';
-    impactPulseDisplay.style.marginTop = '6px';
-    impactPulseDisplay.style.color = '#ff6666';
-    targetsForm.appendChild(impactPulseDisplay);
+    const impulseDisplay = document.createElement('div');
+    impulseDisplay.id = 'impact-pulse-display';
+    impulseDisplay.style.marginTop = '6px';
+    impulseDisplay.style.color = '#ff6666';
+    targetsForm.appendChild(impulseDisplay);
     
     panelTargets.appendChild(targetsForm);
-    calculateImpactPulse();
+    calculateimpulse();
 
     function updateAimBallVisibility() { aimBallWrap.style.display = ''; }
     updateAimBallVisibility();
