@@ -376,7 +376,7 @@
       const side = new THREE.Mesh(sideGeom, sideMat);
       geo.add(side);
 
-      // Top and bottom halves (black / white)
+      // Top and bottom halves: β (absorbing/black), α (reflective/white) — paper surfaces
       const halfA = new THREE.Mesh(
         new THREE.CircleGeometry(radius, 64, 0, Math.PI),
         new THREE.MeshStandardMaterial({ color: 0x111111, metalness: 0.2, roughness: 0.9 })
@@ -444,8 +444,8 @@
       position: new THREE.Vector3(1.0, 0, 0.01), // near Earth's orbit
       velocity: new THREE.Vector3(0, 0, 0),
       lastExitVelocityMps: 0.0,
-      spin: 0.0, // radians per second (visual)
-      spinPhase: 0.0, // accumulated radians for visual rotation
+      spin: 0.0,     // ω (rad/s), paper angular velocity
+      spinPhase: 0.0, // θ (rad), phase angle, paper
       mesh: createTARS()
     };
     scene.add(tars.mesh);
@@ -1188,7 +1188,7 @@
 
     // Tether tensile failure (simplified vs paper Section 9: ribbon midpoint tension σWt = T(0), v_crit = √(2σ/ρ))
     function handleStructuralFailure() {
-      flashHudMessage('TARS structural failure due to excessive tensile pressure!');
+      flashHudMessage('TARS structural failure: tensile stress σ exceeds limit!');
       tars.spin = 0;
       const randomDirection = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
       releasePayloadNow(randomDirection);
@@ -1240,17 +1240,17 @@
 ` +
         `Exit velocity (last): ${tars.lastExitVelocityMps.toFixed(2)} m/s
 ` +
-        `Potential exit velocity: ${(potential_v_mps/1000).toFixed(2)} km/s
+        `Potential exit velocity v: ${(potential_v_mps/1000).toFixed(2)} km/s
 ` +
-        `Tip speed: ${tipSpeedMps.toFixed(1)} m/s
+        `Tip speed v: ${tipSpeedMps.toFixed(1)} m/s
 ` +
         `G-force: ${gForce.toFixed(2)} G
 ` +
-        `Tensile Force (${physics.payloadMass}kg payload): ${(physics.payloadMass * gForce * 9.8).toLocaleString()} N
+        `Tensile force (${physics.payloadMass} kg payload): ${(physics.payloadMass * gForce * 9.8).toLocaleString()} N
 ` +
-        `Tensile Pressure: ${(physics.payloadMass * gForce * 9.8 / physics.tetherCrossSectionalArea).toLocaleString()} Pa
+        `Tensile stress σ: ${(physics.payloadMass * gForce * 9.8 / physics.tetherCrossSectionalArea).toLocaleString()} Pa
 ` +
-        `Spin: ${tars.spin.toFixed(3)} rad/s (${(tars.spin * 60 / (2 * Math.PI)).toFixed(2)} RPM)
+        `ω (spin): ${tars.spin.toFixed(3)} rad/s (${(tars.spin * 60 / (2 * Math.PI)).toFixed(2)} RPM)
 ` +
         `Time scale: ${state.timeScaleMultiplier.toLocaleString()}x realtime (${state.timeScaleYearsPerSec.toExponential(3)} y/s)
 ` +
@@ -1413,7 +1413,7 @@
 
     // Thrust controls
     const thrustWrap = document.createElement('div');
-    const thrustLabel = document.createElement('span'); thrustLabel.textContent = 'Thrust:';
+    const thrustLabel = document.createElement('span'); thrustLabel.textContent = 'Δv:'; thrustLabel.title = 'Apply impulsive Δv to TARS';
     const mkBtn = (txt) => { const b = document.createElement('button'); b.textContent = txt; return b; };
     const btnProg = mkBtn('Prograde');
     const btnRetro = mkBtn('Retrograde');
@@ -1463,7 +1463,7 @@
     physForm.appendChild(makeField('Payload Mass (kg)', 'payloadMass', 100, 0));
     {
       const row = document.createElement('div'); row.className = 'row';
-      const lbl = document.createElement('label'); lbl.textContent = 'Tensile Strength (GPa)';
+      const lbl = document.createElement('label'); lbl.textContent = 'Tensile strength σ (GPa)';
       const input = document.createElement('input'); input.type = 'number';
       input.step = '0.1';
       input.min = '0';
@@ -1485,7 +1485,7 @@
     physForm.appendChild(makeField('R_β reflectivity (absorbing / black)', 'sailReflectivityBlack', 0.01, 0, 1));
     // N-body toggle
     const nBodyRow = document.createElement('div'); nBodyRow.className = 'row';
-    const nBodyLbl = document.createElement('label'); nBodyLbl.textContent = 'N-body (planets attract craft/payloads)';
+    const nBodyLbl = document.createElement('label'); nBodyLbl.textContent = 'N-body (planets attract TARS/payloads)';
     const nBodyChk = document.createElement('input'); nBodyChk.type = 'checkbox'; nBodyChk.checked = physics.nBodyAttractors;
     nBodyChk.onchange = ()=> { physics.nBodyAttractors = nBodyChk.checked; };
     nBodyRow.appendChild(nBodyLbl); nBodyRow.appendChild(nBodyChk);
@@ -1503,6 +1503,7 @@
 
     const sailViewCanvas = document.createElement('canvas');
     sailViewCanvas.id = 'sail-view-canvas';
+    sailViewCanvas.title = 'Disc orientation (phase θ)';
     sailViewCanvas.width = 150;
     sailViewCanvas.height = 150;
     sailViewCanvas.style.marginTop = '10px';
@@ -1607,7 +1608,8 @@
     function refreshVectorRowVisibility(){ vecRow.style.display = ''; }
     refreshVectorRowVisibility();
     const btnLaunch = document.createElement('button');
-    btnLaunch.textContent = 'Launch';
+    btnLaunch.textContent = 'Release payload';
+    btnLaunch.title = 'Release payload at current ω';
     btnLaunch.style.backgroundColor = '#ef4444';
     btnLaunch.style.fontSize = '16px';
     btnLaunch.style.padding = '8px 16px';
@@ -2111,7 +2113,7 @@
     function mpsToAUPerYr(mps) { return mps * (1/149597870700) * (365.25*24*3600); }
     function auPerYrToMps(auPerYr) { return auPerYr * 149597870700 / (365.25*24*3600); }
     function computeSpinDvAUPerYr() {
-      // tip speed [m/s] = spin [rad/s] * (tipScaleMSPerRad)
+      // Exit speed v = ω R (paper: tip speed at release)
       const dv_mps = Math.max(0, tars.spin) * payloadState.tipScaleMSPerRad;
       return mpsToAUPerYr(dv_mps);
     }
@@ -2119,15 +2121,15 @@
       const { prograde } = getOrthoBasis();
       const up = new THREE.Vector3(0, 1, 0);
       const right = new THREE.Vector3().crossVectors(up, prograde).normalize();
-      // Tangent aligned with spin phase by rotating prograde around up
+      // Tangent aligned with phase θ by rotating prograde around up
       return prograde.clone().applyAxisAngle(up, tars.spinPhase).normalize();
     }
 
     function releasePayloadNow(direction) {
-      // Ejection direction and magnitude determine payload exit velocity relative to TARS.
-      const r = physics.sailLeverArm; // Use sailLeverArm as the release radius
-      const w = tars.spin;
-      const v_mps = r * w;
+      // Payload release (paper Section 7): exit velocity v = ω R at radius R.
+      const r = physics.sailLeverArm; // R (disc radius), release at tip
+      const w = tars.spin;            // ω (rad/s)
+      const v_mps = r * w;           // v (m/s)
       let dvAUPerYr = mpsToAUPerYr(v_mps);
 
       let dir = direction;
@@ -2170,7 +2172,7 @@
       [...simObjects.payloads.map(p=>p.id)].forEach(despawnById);
     };
 
-    // ---------- Legacy targeting block removed (merged into Launch panel) ----------
+    // ---------- Legacy targeting block removed (merged into Payload panel) ----------
 
     function setActiveTab(which) {
       const map = {
