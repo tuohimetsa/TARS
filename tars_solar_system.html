@@ -220,7 +220,9 @@
     };
     const autoAimState = {
       running: false,
+      targetType: 'planet',       // 'planet' | 'asteroid'
       targetPlanetName: 'Mars',
+      targetAsteroidId: null,     // when targetType === 'asteroid'
       iterations: 0,
       maxIterations: 20000,
       passes: 5,
@@ -783,6 +785,12 @@
         return accels;
     }
 
+    function sunAccelAU(posAU) {
+      const r2 = posAU.lengthSq();
+      const r = Math.sqrt(r2) + 1e-12;
+      return posAU.clone().multiplyScalar(-physics.muSun / (r*r*r));
+    }
+
     function calculateTrajectory(launchVec) {
       const steps = Math.max(2, Math.min(preview.steps, preview.payload.maxPoints));
       const dt = preview.horizonYears / (steps - 1);
@@ -800,7 +808,13 @@
         payloadVel: null,
         planetPos: null,
         planetVel: null,
+        targetName: null,
       };
+      let asteroidState = null;
+      if (autoAimState.targetType === 'asteroid' && autoAimState.targetAsteroidId) {
+        const ast = simObjects.asteroids.find(a => a.id === autoAimState.targetAsteroidId);
+        if (ast) asteroidState = { id: ast.id, pos: ast.position.clone(), vel: ast.velocity.clone() };
+      }
 
       function localAccel(posAU) {
         const r2 = posAU.lengthSq();
@@ -818,16 +832,34 @@
       }
 
       for (let i = 0; i < steps; i++) {
-        const targetPlanetState = planetStates.find(st => st.name === autoAimState.targetPlanetName);
-        if (targetPlanetState) {
+        if (asteroidState) {
+          const distanceSq = p.distanceToSquared(asteroidState.pos);
+          if (distanceSq < closestApproach.distanceSq) {
+            closestApproach.distanceSq = distanceSq;
+            closestApproach.payloadPos = p.clone();
+            closestApproach.payloadVel = v.clone();
+            closestApproach.planetPos = asteroidState.pos.clone();
+            closestApproach.planetVel = asteroidState.vel.clone();
+            closestApproach.targetName = asteroidState.id;
+          }
+          const aA0 = sunAccelAU(asteroidState.pos.clone());
+          asteroidState.vel.addScaledVector(aA0, dt * 0.5);
+          asteroidState.pos.addScaledVector(asteroidState.vel, dt);
+          const aA1 = sunAccelAU(asteroidState.pos.clone());
+          asteroidState.vel.addScaledVector(aA1, dt * 0.5);
+        } else {
+          const targetPlanetState = planetStates.find(st => st.name === autoAimState.targetPlanetName);
+          if (targetPlanetState) {
             const distanceSq = p.distanceToSquared(targetPlanetState.pos);
             if (distanceSq < closestApproach.distanceSq) {
-                closestApproach.distanceSq = distanceSq;
-                closestApproach.payloadPos = p.clone();
-                closestApproach.payloadVel = v.clone();
-                closestApproach.planetPos = targetPlanetState.pos.clone();
-                closestApproach.planetVel = targetPlanetState.vel.clone();
+              closestApproach.distanceSq = distanceSq;
+              closestApproach.payloadPos = p.clone();
+              closestApproach.payloadVel = v.clone();
+              closestApproach.planetPos = targetPlanetState.pos.clone();
+              closestApproach.planetVel = targetPlanetState.vel.clone();
+              closestApproach.targetName = targetPlanetState.name;
             }
+          }
         }
 
         const a0 = localAccel(p.clone());
@@ -860,7 +892,11 @@
       hitMarker.visible = false;
       closestApproachLine.visible = false;
       ghostPlanet.visible = false;
-      if (!preview.enabled) document.getElementById('preview-info').textContent = '';
+      if (!preview.enabled) {
+        document.getElementById('preview-info').textContent = '';
+        const enc = document.getElementById('asteroid-encounter-display');
+        if (enc) enc.textContent = 'Enable trajectory preview (Payload tab) for encounter info.';
+      }
 
       const positions = preview.payload.positions;
       const colors = preview.payload.colors;
@@ -884,6 +920,16 @@
         payloadVel: null,
         planetPos: null,
         planetVel: null,
+        step: -1,
+      }));
+      const asteroidStates = simObjects.asteroids.map(a => ({ id: a.id, pos: a.position.clone(), vel: a.velocity.clone() }));
+      let closestAsteroidApproaches = asteroidStates.map(a => ({
+        asteroidId: a.id,
+        distanceSq: Infinity,
+        payloadPos: null,
+        payloadVel: null,
+        asteroidPos: null,
+        asteroidVel: null,
         step: -1,
       }));
 
@@ -947,6 +993,23 @@
           const st = planetStates[j];
           const a1p = newPlanetAccels[j];
           st.vel.addScaledVector(a1p, dt * 0.5);
+        }
+        for (let j = 0; j < asteroidStates.length; j++) {
+          const ast = asteroidStates[j];
+          const aA0 = sunAccelAU(ast.pos.clone());
+          ast.vel.addScaledVector(aA0, dt * 0.5);
+          ast.pos.addScaledVector(ast.vel, dt);
+          const aA1 = sunAccelAU(ast.pos.clone());
+          ast.vel.addScaledVector(aA1, dt * 0.5);
+          const distanceSq = p.distanceToSquared(ast.pos);
+          if (distanceSq < closestAsteroidApproaches[j].distanceSq) {
+            closestAsteroidApproaches[j].distanceSq = distanceSq;
+            closestAsteroidApproaches[j].payloadPos = p.clone();
+            closestAsteroidApproaches[j].payloadVel = v.clone();
+            closestAsteroidApproaches[j].asteroidPos = ast.pos.clone();
+            closestAsteroidApproaches[j].asteroidVel = ast.vel.clone();
+            closestAsteroidApproaches[j].step = i;
+          }
         }
 
         // Check for intersection and closest approach
@@ -1017,26 +1080,26 @@
           }
           if (!preview.enabled) previewInfo.textContent = `Impact: ${hitPlanetName} at ${relSpeedMps.toFixed(0)} m/s ${days.toFixed(1)} days${closestPart}`;
       } else {
-          let overallClosest = { distanceSq: Infinity };
-          for (const approach of closestApproaches) {
-              if (approach.distanceSq < overallClosest.distanceSq) {
-                  overallClosest = approach;
-              }
-          }
+          const combined = closestApproaches.map(a => ({ ...a, pos: a.planetPos, vel: a.planetVel, displayName: a.planetName, isPlanet: true }));
+          closestAsteroidApproaches.forEach(a => {
+            if (a.payloadPos) combined.push({ ...a, pos: a.asteroidPos, vel: a.asteroidVel, displayName: a.asteroidId, isPlanet: false });
+          });
+          let overallClosest = combined.reduce((best, a) => (a.distanceSq < best.distanceSq ? a : best), { distanceSq: Infinity });
           if (overallClosest.payloadPos) {
               const line_positions = new Float32Array(6);
               line_positions[0] = overallClosest.payloadPos.x * SCALE;
               line_positions[1] = overallClosest.payloadPos.y * SCALE;
               line_positions[2] = overallClosest.payloadPos.z * SCALE;
-              line_positions[3] = overallClosest.planetPos.x * SCALE;
-              line_positions[4] = overallClosest.planetPos.y * SCALE;
-              line_positions[5] = overallClosest.planetPos.z * SCALE;
+              line_positions[3] = overallClosest.pos.x * SCALE;
+              line_positions[4] = overallClosest.pos.y * SCALE;
+              line_positions[5] = overallClosest.pos.z * SCALE;
               closestApproachLine.geometry.setAttribute('position', new THREE.BufferAttribute(line_positions, 3));
               closestApproachLine.geometry.computeBoundingSphere();
               if (preview.enabled) closestApproachLine.visible = true;
 
-              const planet = planets.find(p => p.name === overallClosest.planetName);
-              if (planet) {
+              if (overallClosest.isPlanet) {
+                const planet = planets.find(p => p.name === overallClosest.planetName);
+                if (planet) {
                   ghostPlanet.geometry = planet.mesh.geometry.clone();
                   ghostPlanet.material.color.set(planet.color);
                   ghostPlanet.position.set(
@@ -1046,17 +1109,30 @@
                   );
                   ghostPlanet.scale.copy(planet.mesh.scale);
                   if (preview.enabled) ghostPlanet.visible = true;
+                }
+              } else {
+                ghostPlanet.visible = false;
               }
 
-              const relVel = new THREE.Vector3().subVectors(overallClosest.payloadVel, overallClosest.planetVel);
+              const relVel = new THREE.Vector3().subVectors(overallClosest.payloadVel, overallClosest.vel);
               const relSpeedMps = auPerYrToMps(relVel.length());
               const distKm = Math.sqrt(overallClosest.distanceSq) * SCALE;
               const days = (overallClosest.step !== undefined && overallClosest.step >= 0) ? (overallClosest.step * dt * 365.25) : -1;
               if (days >= 0) {
-                previewInfo.textContent = `Closest approach: ${overallClosest.planetName} in ${days.toFixed(1)} days (${distKm.toExponential(2)} km at ${relSpeedMps.toFixed(0)} m/s)`;
+                previewInfo.textContent = `Closest approach: ${overallClosest.displayName} in ${days.toFixed(1)} days (${distKm.toExponential(2)} km at ${relSpeedMps.toFixed(0)} m/s)`;
               } else {
-                previewInfo.textContent = `Closest approach: ${overallClosest.planetName} (${distKm.toExponential(2)} km at ${relSpeedMps.toFixed(0)} m/s)`;
+                previewInfo.textContent = `Closest approach: ${overallClosest.displayName} (${distKm.toExponential(2)} km at ${relSpeedMps.toFixed(0)} m/s)`;
               }
+          }
+          const encounterEl = document.getElementById('asteroid-encounter-display');
+          if (encounterEl && closestAsteroidApproaches.length > 0) {
+            encounterEl.innerHTML = '<strong>Encounter (preview)</strong><br>' + closestAsteroidApproaches
+              .filter(a => a.step >= 0)
+              .map(a => {
+                const distKm = Math.sqrt(a.distanceSq) * SCALE;
+                const days = a.step * dt * 365.25;
+                return `${a.asteroidId}: ${distKm.toExponential(2)} km in ${days.toFixed(0)} days`;
+              }).join('<br>') || 'No encounter in horizon.';
           }
       }
 
@@ -1303,7 +1379,12 @@
 
     const autoAimForm = document.createElement('div'); autoAimForm.className = 'btnbar';
     const autoAimRow = document.createElement('div'); autoAimRow.className = 'row';
-    const autoAimLabel = document.createElement('label'); autoAimLabel.textContent = 'Target Planet:';
+    const autoAimTargetTypeLabel = document.createElement('label'); autoAimTargetTypeLabel.textContent = 'Target:';
+    const autoAimTargetTypeSelect = document.createElement('select');
+    autoAimTargetTypeSelect.innerHTML = '<option value="planet">Planet</option><option value="asteroid">Asteroid</option>';
+    autoAimTargetTypeSelect.value = autoAimState.targetType;
+    const autoAimPlanetWrap = document.createElement('span');
+    const autoAimLabel = document.createElement('label'); autoAimLabel.textContent = 'Planet:';
     const autoAimSelect = document.createElement('select');
     for (const name of ['Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune']) {
       const opt = document.createElement('option');
@@ -1312,17 +1393,56 @@
       if (name === 'Mars') opt.selected = true;
       autoAimSelect.appendChild(opt);
     }
+    const autoAimAsteroidWrap = document.createElement('span');
+    autoAimAsteroidWrap.style.display = 'none';
+    const autoAimAsteroidLabel = document.createElement('label'); autoAimAsteroidLabel.textContent = 'Asteroid:';
+    const autoAimAsteroidSelect = document.createElement('select');
+    function refreshAsteroidTargetOptions() {
+      autoAimAsteroidSelect.innerHTML = '';
+      if (simObjects.asteroids.length === 0) {
+        const opt = document.createElement('option'); opt.value = ''; opt.textContent = '(spawn one first)';
+        autoAimAsteroidSelect.appendChild(opt);
+      } else {
+        simObjects.asteroids.forEach((a, i) => {
+          const opt = document.createElement('option'); opt.value = a.id; opt.textContent = a.id;
+          if (i === 0) opt.selected = true;
+          autoAimAsteroidSelect.appendChild(opt);
+        });
+        autoAimState.targetAsteroidId = autoAimAsteroidSelect.value || null;
+      }
+    }
+    autoAimAsteroidSelect.onchange = () => { autoAimState.targetAsteroidId = autoAimAsteroidSelect.value || null; };
+    autoAimTargetTypeSelect.onchange = () => {
+      autoAimState.targetType = autoAimTargetTypeSelect.value;
+      autoAimPlanetWrap.style.display = autoAimState.targetType === 'planet' ? '' : 'none';
+      autoAimAsteroidWrap.style.display = autoAimState.targetType === 'asteroid' ? '' : 'none';
+      if (autoAimState.targetType === 'asteroid') refreshAsteroidTargetOptions();
+    };
+    autoAimPlanetWrap.appendChild(autoAimLabel);
+    autoAimPlanetWrap.appendChild(autoAimSelect);
+    autoAimAsteroidWrap.appendChild(autoAimAsteroidLabel);
+    autoAimAsteroidWrap.appendChild(autoAimAsteroidSelect);
     const autoAimBtn = document.createElement('button'); autoAimBtn.textContent = 'Auto-Aim';
     autoAimBtn.style.backgroundColor = '#22c55e';
+    function getAutoAimTargetName() {
+      if (autoAimState.targetType === 'asteroid') return autoAimState.targetAsteroidId || 'asteroid';
+      return autoAimState.targetPlanetName;
+    }
     autoAimBtn.onclick = () => {
       if (autoAimState.running) return;
-      autoAimState.running = true;
+      autoAimState.targetType = autoAimTargetTypeSelect.value;
       autoAimState.targetPlanetName = autoAimSelect.value;
+      autoAimState.targetAsteroidId = autoAimAsteroidSelect.value || null;
+      if (autoAimState.targetType === 'asteroid' && !autoAimState.targetAsteroidId) {
+        autoAimInfo.textContent = 'Spawn an asteroid first, then select it.';
+        return;
+      }
+      autoAimState.running = true;
       autoAimState.iterations = 0;
       autoAimState.best.dist = Infinity;
       autoAimBtn.style.display = 'none';
       autoAimCancelBtn.style.display = 'inline-block';
-      autoAimInfo.textContent = `Searching for trajectory to ${autoAimState.targetPlanetName}...`;
+      autoAimInfo.textContent = `Searching for trajectory to ${getAutoAimTargetName()}...`;
 
       const learningRate = 0.01; // Reduced learning rate for stability with momentum
       const epsilon = 1e-6;
@@ -1339,7 +1459,7 @@
             autoAimInfo.textContent = 'No solution found.';
           } else {
             const distKm = Math.sqrt(autoAimState.best.dist) * SCALE;
-            autoAimInfo.textContent = `Best solution found: ${distKm.toExponential(2)} km`;
+            autoAimInfo.textContent = `Best solution found: ${distKm.toExponential(2)} km (${getAutoAimTargetName()})`;
           }
           return;
         }
@@ -1353,7 +1473,7 @@
           payloadState.vecZ = autoAimState.best.vec.z;
           preview.dirty = true;
           const distKm = Math.sqrt(autoAimState.best.dist) * SCALE;
-          autoAimInfo.textContent = `Best solution so far: ${distKm.toExponential(2)} km`;
+          autoAimInfo.textContent = `Best so far: ${distKm.toExponential(2)} km (${getAutoAimTargetName()})`;
         }
 
         // Calculate gradient
@@ -1387,10 +1507,12 @@
     const autoAimInfo = document.createElement('div');
     autoAimInfo.style.marginTop = '4px';
     autoAimInfo.style.color = '#66ccff';
-    autoAimInfo.textContent = 'Select a target and click Auto-Aim.';
+    autoAimInfo.textContent = 'Select target (Planet or Asteroid) and click Auto-Aim.';
 
-    autoAimRow.appendChild(autoAimLabel);
-    autoAimRow.appendChild(autoAimSelect);
+    autoAimRow.appendChild(autoAimTargetTypeLabel);
+    autoAimRow.appendChild(autoAimTargetTypeSelect);
+    autoAimRow.appendChild(autoAimPlanetWrap);
+    autoAimRow.appendChild(autoAimAsteroidWrap);
     autoAimRow.appendChild(autoAimBtn);
     const autoAimCancelBtn = document.createElement('button');
     autoAimCancelBtn.textContent = 'Cancel';
@@ -1769,6 +1891,7 @@
       }
       simObjects.asteroids.push(asteroid);
       calculateimpulse();
+      if (typeof refreshAsteroidTargetOptions === 'function') refreshAsteroidTargetOptions();
       return id;
     }
     
@@ -1818,6 +1941,15 @@
     impulseDisplay.style.marginTop = '6px';
     impulseDisplay.style.color = '#ff6666';
     targetsForm.appendChild(impulseDisplay);
+
+    const encounterDisplay = document.createElement('div');
+    encounterDisplay.id = 'asteroid-encounter-display';
+    encounterDisplay.style.marginTop = '10px';
+    encounterDisplay.style.fontSize = '12px';
+    encounterDisplay.style.color = '#66ccff';
+    encounterDisplay.style.whiteSpace = 'pre-wrap';
+    encounterDisplay.textContent = 'Enable trajectory preview (Payload tab) for encounter info.';
+    targetsForm.appendChild(encounterDisplay);
     
     panelTargets.appendChild(targetsForm);
     calculateimpulse();
