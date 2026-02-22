@@ -11,7 +11,10 @@
       background: rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.15); border-radius: 8px;
       line-height: 1.2; font-size: 12px; white-space: pre; user-select: none; max-width: min(92vw, 520px);
     }
-    #legend { position: fixed; right: 10px; bottom: 10px; z-index: 10; font-size: 11px; opacity: 0.8; }
+    #legend { position: fixed; right: 10px; bottom: 10px; z-index: 10; font-size: 10px; opacity: 0.9; line-height: 1.5; max-width: 320px; padding: 8px 10px; background: rgba(0,0,0,0.4); border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); }
+    #legend .legend-section { margin-top: 6px; }
+    #legend .legend-section:first-child { margin-top: 0; }
+    #legend kbd { font-family: inherit; padding: 0 3px; background: rgba(255,255,255,0.15); border-radius: 2px; }
     a { color: #8ec7ff; text-decoration: none; }
     .btnbar { margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap; align-items: center; white-space: normal; }
     .btnbar .row { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; width: 100%; }
@@ -33,7 +36,11 @@
 <body>
   <div id="hud"></div>
   <div id="legend">
-    Mouse: drag to orbit • right-drag to pan • wheel to zoom
+    <div class="legend-section"><strong>Mouse</strong>: drag orbit • right-drag pan • wheel zoom</div>
+    <div class="legend-section"><strong>Time</strong>: <kbd>Space</kbd> Pause • <kbd>+</kbd><kbd>−</kbd> Timescale</div>
+    <div class="legend-section"><strong>View</strong>: <kbd>O</kbd> Orbits • <kbd>S</kbd> Stars • <kbd>L</kbd> Labels • <kbd>T</kbd> Trails • <kbd>F</kbd> Follow • <kbd>R</kbd> Reset</div>
+    <div class="legend-section"><strong>TARS</strong>: <kbd>P</kbd> Spin-up • <kbd>X</kbd><kbd>Z</kbd> Spin ±</div>
+    <div class="legend-section"><strong>Δv</strong>: <kbd>↑</kbd><kbd>↓</kbd> Pro/retro • <kbd>←</kbd><kbd>→</kbd> Radial</div>
   </div>
 
   <script type="importmap">
@@ -376,14 +383,14 @@
       const side = new THREE.Mesh(sideGeom, sideMat);
       geo.add(side);
 
-      // Top and bottom halves: β (absorbing/black), α (reflective/white) — paper surfaces
+      // Top and bottom halves: α (reflective/white), β (absorbing/black) — flipped 180° vs paper
       const halfA = new THREE.Mesh(
         new THREE.CircleGeometry(radius, 64, 0, Math.PI),
-        new THREE.MeshStandardMaterial({ color: 0x111111, metalness: 0.2, roughness: 0.9 })
+        new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 0.2, roughness: 0.9 })
       );
       const halfB = new THREE.Mesh(
         new THREE.CircleGeometry(radius, 64, Math.PI, Math.PI),
-        new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 0.2, roughness: 0.9 })
+        new THREE.MeshStandardMaterial({ color: 0x111111, metalness: 0.2, roughness: 0.9 })
       );
       const top = new THREE.Group();
       halfA.rotation.x = -Math.PI / 2;
@@ -411,20 +418,20 @@
       seam.rotation.y = Math.PI / 2;
       geo.add(seam);
 
-      // Port and Starboard markers
+      // Port and Starboard markers (offset 90° from spin so they stay at left/right of disc)
       const markerGeom = new THREE.SphereGeometry(0.02, 12, 12);
       const portMarker = new THREE.Mesh(
         markerGeom,
         new THREE.MeshBasicMaterial({ color: 0xff0000 }) // Red for Port (left)
       );
-      portMarker.position.set(0, radius, 0);
+      portMarker.position.set(0, 0, radius); // 90° offset from rotation, flipped
       geo.add(portMarker);
 
       const starboardMarker = new THREE.Mesh(
         markerGeom,
         new THREE.MeshBasicMaterial({ color: 0x00ff00 }) // Green for Starboard (right)
       );
-      starboardMarker.position.set(0, -radius, 0);
+      starboardMarker.position.set(0, 0, -radius); // 90° offset from rotation, flipped
       geo.add(starboardMarker);
 
       // Keep disc HORIZONTAL relative to spinNode (normal along local Y)
@@ -1397,7 +1404,7 @@
 
     // Time slider
     const speedWrap = document.createElement('div');
-    const speedLabel = document.createElement('span'); speedLabel.textContent = 'Scale:';
+    const speedLabel = document.createElement('span'); speedLabel.textContent = 'Timescale:';
     const speedValue = document.createElement('span'); speedValue.className = 'muted value';
     const speedInput = document.createElement('input'); speedInput.type = 'range'; speedInput.min = '0'; speedInput.max = '9'; speedInput.step = '0.01'; speedInput.value = String(Math.log10(state.timeScaleMultiplier));
     const speedNumber = document.createElement('input'); speedNumber.type = 'number'; speedNumber.min = '1'; speedNumber.max = '1000000000'; speedNumber.step = '1'; speedNumber.value = String(state.timeScaleMultiplier); speedNumber.style.width = '90px';
@@ -2315,37 +2322,98 @@
       renderer.setSize(window.innerWidth, window.innerHeight);
     });
 
-    // Labels via CanvasTexture sprites
+    // Labels via CanvasTexture sprites (updatable for distance from focus)
+    const LABEL_CANVAS_W = 150;
+    const LABEL_CANVAS_H = 80;
+    const LABEL_FONT_MAIN = 'bold 22px sans-serif';
+    const LABEL_FONT_SUB = '16px sans-serif';
+    const LABEL_LINE_HEIGHT = 22;
+
+    function setLabelText(sprite, text) {
+      const cnv = sprite.userData.canvas;
+      const tex = sprite.userData.tex;
+      if (!cnv || !tex) return;
+      const ctx = cnv.getContext('2d');
+      ctx.clearRect(0, 0, LABEL_CANVAS_W, LABEL_CANVAS_H);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const lines = String(text).split('\n');
+      const n = lines.length;
+      const startY = (LABEL_CANVAS_H - (n - 1) * LABEL_LINE_HEIGHT) / 2 + LABEL_LINE_HEIGHT / 2;
+      for (let i = 0; i < n; i++) {
+        ctx.font = i === 0 ? LABEL_FONT_MAIN : LABEL_FONT_SUB;
+        ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+        ctx.lineWidth = 3;
+        ctx.strokeText(lines[i], LABEL_CANVAS_W / 2, startY + i * LABEL_LINE_HEIGHT);
+        ctx.fillStyle = i === 0 ? '#fff' : '#ccc';
+        ctx.fillText(lines[i], LABEL_CANVAS_W / 2, startY + i * LABEL_LINE_HEIGHT);
+      }
+      tex.needsUpdate = true;
+    }
+
     function createLabelSprite(text) {
       const cnv = document.createElement('canvas');
+      cnv.width = LABEL_CANVAS_W;
+      cnv.height = LABEL_CANVAS_H;
       const ctx = cnv.getContext('2d');
-      const fs = 24; // smaller font
-      const font = `bold ${fs}px sans-serif`;
-      ctx.font = font;
-      const w = Math.ceil(ctx.measureText(text).width) + 16;
-      const h = fs + 16;
-      cnv.width = w; cnv.height = h;
-
-      ctx.font = font;
-      ctx.textBaseline = 'middle';
-      ctx.textAlign = 'center';
-
-      ctx.strokeStyle = 'rgba(0,0,0,0.7)';
-      ctx.lineWidth = 4;
-      ctx.strokeText(text, w/2, h/2);
-
-      ctx.fillStyle = 'white';
-      ctx.fillText(text, w/2, h/2);
-
       const tex = new THREE.CanvasTexture(cnv);
-      tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
       const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, depthWrite: false, transparent: true });
       const sprite = new THREE.Sprite(mat);
       sprite.userData.name = text;
+      sprite.userData.canvas = cnv;
+      sprite.userData.tex = tex;
       sprite.renderOrder = 9999;
-      sprite.visible = state.showLabels; // Set initial visibility
+      sprite.visible = state.showLabels;
       allLabels.push(sprite);
+      setLabelText(sprite, text);
       return sprite;
+    }
+
+    function getFocusPositionAU() {
+      if (state.focus === 'Sun') return new THREE.Vector3(0, 0, 0);
+      if (state.focus === 'TARS') return tars.position.clone();
+      const planet = planets.find(p => p.name === state.focus);
+      if (planet) return planet.position.clone();
+      const pl = simObjects.payloads.find(p => p.id === state.focus);
+      if (pl) return pl.position.clone();
+      const ast = simObjects.asteroids.find(a => a.id === state.focus);
+      if (ast) return ast.position.clone();
+      return null;
+    }
+
+    function formatKm(km) {
+      if (km >= 1e9) return (km / 1e9).toFixed(2) + ' Gkm';
+      if (km >= 1e6) return (km / 1e6).toFixed(2) + ' Mkm';
+      if (km >= 1e3) return (km / 1e3).toFixed(1) + '×10³ km';
+      return km.toFixed(0) + ' km';
+    }
+
+    function updateLabelDistances() {
+      const focusPos = getFocusPositionAU();
+      if (!focusPos) return;
+      const focusPosCopy = focusPos.clone();
+      for (const p of planets) {
+        const distAU = p.position.distanceTo(focusPosCopy);
+        const distKm = distAU * SCALE;
+        setLabelText(p.label, `${p.name}\n${distAU.toFixed(3)} AU\n${formatKm(distKm)}`);
+      }
+      const tarsDistAU = tars.position.distanceTo(focusPosCopy);
+      setLabelText(tarsLabel, `TARS\n${tarsDistAU.toFixed(3)} AU\n${formatKm(tarsDistAU * SCALE)}`);
+      for (const pl of simObjects.payloads) {
+        const distAU = pl.position.distanceTo(focusPosCopy);
+        setLabelText(pl.label, `Payload\n${distAU.toFixed(3)} AU\n${formatKm(distAU * SCALE)}`);
+      }
+      for (const m of simObjects.markers) {
+        const distAU = m.position.distanceTo(focusPosCopy);
+        const name = (m.label && m.label.userData && m.label.userData.name) || 'Target';
+        setLabelText(m.label, `${name}\n${distAU.toFixed(3)} AU\n${formatKm(distAU * SCALE)}`);
+      }
+      for (const a of simObjects.asteroids) {
+        const distAU = a.position.distanceTo(focusPosCopy);
+        setLabelText(a.label, `Asteroid\n${distAU.toFixed(3)} AU\n${formatKm(distAU * SCALE)}`);
+      }
     }
     for (const p of planets) {
       const label = createLabelSprite(p.name);
@@ -2591,15 +2659,18 @@
         // Spin geometry around spinNode's local Y so the disc remains vertical (tie to simulation time)
         tars.spinPhase = (tars.spinPhase + tars.spin * frameSimYears * YEAR_SECONDS) % (Math.PI * 2);
         const sn = tars.mesh.userData.spinNode;
-        if (sn) { sn.rotation.y = tars.spinPhase; }
+        if (sn) { sn.rotation.y = Math.PI / 2 - tars.spinPhase; }
       }
 
       // Update controls
       controls.update(realDtSeconds);
 
+      if (state.showLabels) {
+        updateLabelDistances();
+      }
       for (const label of allLabels) {
         const distance = camera.position.distanceTo(label.getWorldPosition(new THREE.Vector3()));
-        const scale = distance * 0.05;
+        const scale = distance * 0.08;
         label.scale.set(scale, scale, 1);
       }
       if (hitMarker.visible) {
